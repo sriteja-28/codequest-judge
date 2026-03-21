@@ -1,0 +1,22 @@
+# python
+venv/
+leet_venv/
+__pycache__/
+*.pyc
+
+# environment
+.env*
+
+# logs
+*.log
+
+# temp files
+/tmp/
+*.tmp
+
+# docker
+*.pid
+
+# compiled outputs
+*.o
+*.out
