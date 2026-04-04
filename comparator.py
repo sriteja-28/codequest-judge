@@ -21,11 +21,35 @@ def normalize(text: str) -> str:
     return "\n".join(lines)
 
 
+# def compare(actual: str, expected: str) -> bool:
+#     """
+#     Return True if actual output matches expected output after normalization.
+#     """
+#     return normalize(actual) == normalize(expected)
+
+
 def compare(actual: str, expected: str) -> bool:
-    """
-    Return True if actual output matches expected output after normalization.
-    """
-    return normalize(actual) == normalize(expected)
+    import json
+
+    a = normalize(actual)
+    e = normalize(expected)
+
+    # trying json comparison
+    try:
+        a_json = json.loads(a)
+        e_json = json.loads(e)
+
+        # handling list comparison
+        if isinstance(a_json, list) and isinstance(e_json, list):
+            return a_json == e_json  # or sorted(...) if order doesn't matter
+
+        return a_json == e_json
+
+    except Exception:
+        pass
+
+    # fallback to string compare
+    return a == e
 
 
 def compare_float(actual: str, expected: str, tolerance: float = 1e-5) -> bool:

@@ -62,6 +62,7 @@ def on_message(channel, method, properties, body):
             problem_id=job["problem_id"],
             language=job["language"],
             code=job["code"],
+            run_sample=job.get("run_sample", False), 
         )
 
         # ACK — remove from queue

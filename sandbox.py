@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 # ─── Platform detection ───────────────────────────────────────────────────────
 
 IS_WINDOWS = platform.system() == "Windows"
-IS_LINUX   = platform.system() == "Linux"
+IS_LINUX = platform.system() == "Linux"
 
 # ─── Optional seccomp profile (Linux production only) ────────────────────────
 #
@@ -71,8 +71,8 @@ IS_LINUX   = platform.system() == "Linux"
 # Restricts ~300 Linux syscalls to the minimum needed for code execution.
 # Ignored on Windows/macOS (Docker Desktop handles isolation differently).
 #
-_HERE              = Path(__file__).parent
-SECCOMP_PROFILE    = _HERE / "seccomp_default.json"
+_HERE = Path(__file__).parent
+SECCOMP_PROFILE = _HERE / "seccomp_default.json"
 
 
 # ─── Language configuration ───────────────────────────────────────────────────
@@ -86,68 +86,68 @@ SECCOMP_PROFILE    = _HERE / "seccomp_default.json"
 #
 @dataclass
 class LanguageConfig:
-    image:       str           # Docker image tag to use
-    filename:    str           # Name to save the user's code as
-    compile_cmd: Optional[str] # Shell command to compile (None for interpreted)
-    run_cmd:     str           # Shell command to run (always reads from /code/stdin.txt)
+    image: str  # Docker image tag to use
+    filename: str  # Name to save the user's code as
+    compile_cmd: Optional[str]  # Shell command to compile (None for interpreted)
+    run_cmd: str  # Shell command to run (always reads from /code/stdin.txt)
     version_cmd: str = "echo unknown"  # Used in health checks / build verification
 
 
 LANGUAGE_CONFIG: dict[str, LanguageConfig] = {
     "python": LanguageConfig(
-        image       = "codequest-python",
-        filename    = "solution.py",
-        compile_cmd = None,   # interpreted — no compile step
-        run_cmd     = "python3 -u /code/solution.py < /code/stdin.txt",
-        version_cmd = "python3 --version",
+        image="codequest-python",
+        filename="solution.py",
+        compile_cmd=None,  # interpreted — no compile step
+        run_cmd="python3 -u /code/solution.py < /code/stdin.txt",
+        version_cmd="python3 --version",
     ),
     "cpp": LanguageConfig(
-        image       = "codequest-cpp",
-        filename    = "solution.cpp",
+        image="codequest-cpp",
+        filename="solution.cpp",
         # Compile into /tmp (writable tmpfs) — NOT /code (read-only mount)
-        compile_cmd = "g++ -O2 -std=c++17 -Wall -o /tmp/sol /code/solution.cpp",
-        run_cmd     = "/tmp/sol < /code/stdin.txt",
-        version_cmd = "g++ --version",
+        # compile_cmd = "g++ -O2 -std=c++17 -Wall -o /tmp/sol /code/solution.cpp",
+        # run_cmd     = "/tmp/sol < /code/stdin.txt",
+        compile_cmd="g++ -O2 -std=c++17 -Wall -o /code/sol /code/solution.cpp",
+        run_cmd="/code/sol < /code/stdin.txt",
+
+        version_cmd="g++ --version",
     ),
     "java": LanguageConfig(
-        image       = "codequest-java",
-        filename    = "Solution.java",
-        compile_cmd = "javac /code/Solution.java -d /tmp",
-        run_cmd     = "java -cp /tmp -Xmx200m Solution < /code/stdin.txt",
-        version_cmd = "java --version",
+        image="codequest-java",
+        filename="Solution.java",
+        compile_cmd="javac /code/Solution.java -d /tmp",
+        run_cmd="java -cp /tmp -Xmx200m Solution < /code/stdin.txt",
+        version_cmd="java --version",
     ),
     "javascript": LanguageConfig(
-        image       = "codequest-js",
-        filename    = "solution.js",
-        compile_cmd = None,
-        run_cmd     = "node --max-old-space-size=200 /code/solution.js < /code/stdin.txt",
-        version_cmd = "node --version",
+        image="codequest-js",
+        filename="solution.js",
+        compile_cmd=None,
+        run_cmd="node --max-old-space-size=200 /code/solution.js < /code/stdin.txt",
+        version_cmd="node --version",
     ),
 }
 
 
 # ─── Result dataclass ─────────────────────────────────────────────────────────
 
+
 @dataclass
 class SandboxResult:
-    stdout:    str
-    stderr:    str
+    stdout: str
+    stderr: str
     exit_code: int
-    time_ms:   int
+    time_ms: int
     memory_kb: Optional[int]
     timed_out: bool
 
     # Compile-phase fields (populated for compiled languages)
-    compile_error:  bool = False
-    compile_stderr: str  = ""
+    compile_error: bool = False
+    compile_stderr: str = ""
 
     @property
     def success(self) -> bool:
-        return (
-            self.exit_code == 0
-            and not self.timed_out
-            and not self.compile_error
-        )
+        return self.exit_code == 0 and not self.timed_out and not self.compile_error
 
     def __repr__(self) -> str:
         return (
@@ -158,6 +158,7 @@ class SandboxResult:
 
 
 # ─── Sandbox class ────────────────────────────────────────────────────────────
+
 
 class Sandbox:
     """
@@ -170,12 +171,12 @@ class Sandbox:
 
     def __init__(
         self,
-        cpu_time_limit:  int = 10,    # wall-clock seconds per execution phase
+        cpu_time_limit: int = 10,  # wall-clock seconds per execution phase
         memory_limit_mb: int = 256,
     ):
-        self.cpu_time_limit  = cpu_time_limit
+        self.cpu_time_limit = cpu_time_limit
         self.memory_limit_mb = memory_limit_mb
-        self.client          = docker.from_env()
+        self.client = docker.from_env()
         self._log_env()
 
     def _log_env(self):
@@ -208,8 +209,12 @@ class Sandbox:
         if config is None:
             supported = ", ".join(LANGUAGE_CONFIG)
             return SandboxResult(
-                stdout="", stderr=f"Unsupported language '{language}'. Supported: {supported}",
-                exit_code=1, time_ms=0, memory_kb=None, timed_out=False,
+                stdout="",
+                stderr=f"Unsupported language '{language}'. Supported: {supported}",
+                exit_code=1,
+                time_ms=0,
+                memory_kb=None,
+                timed_out=False,
             )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -222,7 +227,7 @@ class Sandbox:
         Called by the worker on startup and periodically.
         """
         result = self.run(language, "print('ok')\n", "")
-        ok     = result.success and "ok" in result.stdout
+        ok = result.success and "ok" in result.stdout
         if not ok:
             logger.error("Sandbox health check FAILED for %s: %r", language, result)
         return ok
@@ -231,8 +236,8 @@ class Sandbox:
 
     @staticmethod
     def _write_files(tmpdir: str, config: LanguageConfig, code: str, stdin_data: str):
-        Path(tmpdir, config.filename).write_text(code,          encoding="utf-8")
-        Path(tmpdir, "stdin.txt"   ).write_text(stdin_data or "", encoding="utf-8")
+        Path(tmpdir, config.filename).write_text(code, encoding="utf-8")
+        Path(tmpdir, "stdin.txt").write_text(stdin_data or "", encoding="utf-8")
 
     # ── Container execution ─────────────────────────────────────────────────
 
@@ -243,21 +248,23 @@ class Sandbox:
         Security settings are always applied.
         """
         kwargs: dict = {
-            "image":   config.image,
+            "image": config.image,
             "volumes": {
                 # os.path.abspath is required on Windows where Docker Desktop
                 # needs a proper drive-letter path (e.g. C:\Users\...)
-                os.path.abspath(code_dir): {"bind": "/code", "mode": "ro"},
+                # os.path.abspath(code_dir): {"bind": "/code", "mode": "ro"},
+                os.path.abspath(code_dir): {"bind": "/code", "mode": "rw"},
             },
-            "stdin_open":       False,          # stdin via file redirect
-            "detach":           True,
-            "network_disabled": True,           # no internet inside container
-            "read_only":        True,           # immutable root fs
-            "tmpfs":            {"/tmp": "size=128m,noexec"},  # compiler scratch space
-            "mem_limit":        f"{self.memory_limit_mb}m",
-            "memswap_limit":    f"{self.memory_limit_mb}m",    # disable swap
-            "pids_limit":       64,             # kill fork-bombs
-            "user":             "nobody",       # non-root
+            "stdin_open": False,  # stdin via file redirect
+            "detach": True,
+            "network_disabled": True,  # no internet inside container
+            "read_only": True,  # immutable root fs
+            # "tmpfs":            {"/tmp": "size=128m,noexec"},  # compiler scratch space
+            "tmpfs": {"/tmp": "size=128m"},
+            "mem_limit": f"{self.memory_limit_mb}m",
+            "memswap_limit": f"{self.memory_limit_mb}m",  # disable swap
+            "pids_limit": 64,  # kill fork-bombs
+            "user": "nobody",  # non-root
         }
 
         # Seccomp profile — Linux production only
@@ -278,15 +285,17 @@ class Sandbox:
         the VM layer adds 1-3 seconds of overhead.
         """
         wall_clock = self.cpu_time_limit + 5
-        timed_out  = False
-        exit_code  = 1
+        timed_out = False
+        exit_code = 1
 
         try:
-            result    = container.wait(timeout=wall_clock)
+            result = container.wait(timeout=wall_clock)
             exit_code = result.get("StatusCode", 1)
         except Exception:
             timed_out = True
-            logger.warning("Container timed out during %s phase (limit=%ds)", phase, wall_clock)
+            logger.warning(
+                "Container timed out during %s phase (limit=%ds)", phase, wall_clock
+            )
             try:
                 container.kill()
             except Exception:
@@ -300,7 +309,7 @@ class Sandbox:
         Returns KB or None if unavailable (common on Docker Desktop / cgroup v1).
         """
         try:
-            stats     = container.stats(stream=False)
+            stats = container.stats(stream=False)
             max_usage = stats.get("memory_stats", {}).get("max_usage", 0)
             return max_usage // 1024 if max_usage else None
         except Exception:
@@ -327,21 +336,21 @@ class Sandbox:
         # ── Phase 1: Compile (C++, Java) ────────────────────────────────────
         if config.compile_cmd:
             compile_result = self._run_phase(
-                config    = config,
-                code_dir  = code_dir,
-                cmd       = config.compile_cmd,
-                phase     = "compile",
+                config=config,
+                code_dir=code_dir,
+                cmd=config.compile_cmd,
+                phase="compile",
             )
             if not compile_result.success:
                 return SandboxResult(
-                    stdout         = "",
-                    stderr         = compile_result.stderr,
-                    exit_code      = compile_result.exit_code,
-                    time_ms        = compile_result.time_ms,
-                    memory_kb      = None,
-                    timed_out      = compile_result.timed_out,
-                    compile_error  = True,
-                    compile_stderr = compile_result.stderr,
+                    stdout="",
+                    stderr=compile_result.stderr,
+                    exit_code=compile_result.exit_code,
+                    time_ms=compile_result.time_ms,
+                    memory_kb=None,
+                    timed_out=compile_result.timed_out,
+                    compile_error=True,
+                    compile_stderr=compile_result.stderr,
                 )
             # For compiled languages, the compile container produced /tmp/sol
             # but /tmp is inside the container — not accessible from the host.
@@ -353,48 +362,68 @@ class Sandbox:
         # ── Phase 2: Run (interpreted or already compiled above) ────────────
         return self._run_phase(config, code_dir, config.run_cmd, "run")
 
-    def _run_phase(
-        self,
-        config:   LanguageConfig,
+    def _run_phase( self,
+        config: LanguageConfig,
         code_dir: str,
-        cmd:      str,
-        phase:    str,
-    ) -> SandboxResult:
-        """
-        Spin up one container, run one shell command, collect results.
-        """
+        cmd: str,
+        phase: str,):
         start_time = time.monotonic()
-        container  = None
+        container = None
 
         try:
             kwargs = self._base_container_kwargs(config, code_dir)
-            kwargs["command"] = ["/bin/sh", "-c", cmd]
 
+            # For run phase, use wrapper to capture memory cross-platform
+            if phase == "run":
+                actual_cmd = f"/usr/bin/time -v sh -c \"{cmd}\" 2>/code/time_stats.txt"
+            else:
+                actual_cmd = cmd
+
+            kwargs["command"] = ["/bin/sh", "-c", actual_cmd]
             container = self.client.containers.run(**kwargs)
 
             exit_code, timed_out = self._wait_container(container, phase)
-            elapsed_ms           = int((time.monotonic() - start_time) * 1000)
-            memory_kb            = self._collect_stats(container)
+            elapsed_ms = int((time.monotonic() - start_time) * 1000)
 
-            stdout = container.logs(stdout=True,  stderr=False).decode("utf-8", errors="replace")
-            stderr = container.logs(stdout=False, stderr=True ).decode("utf-8", errors="replace")
+            # Try Docker stats first (Linux), fall back to time file (Windows/macOS)
+            memory_kb = self._collect_stats(container)
+            if not memory_kb:
+                memory_kb = self._collect_memory_from_file(code_dir)
+
+            stdout = container.logs(stdout=True, stderr=False).decode("utf-8", errors="replace")
+            # stderr is now in time_stats.txt for run phase, still in logs for compile
+            if phase in ("run", "compile+run"):
+                stderr_file = Path(code_dir) / "time_stats.txt"
+                try:
+                    raw_stderr = stderr_file.read_text(errors="replace") if stderr_file.exists() else ""
+                    # Strip the /usr/bin/time lines, keep only actual stderr
+                    stderr = "\n".join(
+                        l for l in raw_stderr.splitlines()
+                        if not any(k in l for k in [
+                            "Command being timed", "Maximum resident", "Elapsed",
+                            "Percent of CPU", "Major (requiring", "Minor (reclaiming",
+                            "Voluntary context", "Involuntary context", "File system",
+                            "Socket messages", "Signals delivered", "Page size",
+                            "Exit status", "wall clock", "Maximum",
+                        ])
+                    )
+                except Exception:
+                    stderr = container.logs(stdout=False, stderr=True).decode("utf-8", errors="replace")
+            else:
+                stderr = container.logs(stdout=False, stderr=True).decode("utf-8", errors="replace")
 
             return SandboxResult(
-                stdout    = stdout[:65_536],    # 64 KB cap
-                stderr    = stderr[:8_192],
-                exit_code = exit_code,
-                time_ms   = elapsed_ms,
-                memory_kb = memory_kb,
-                timed_out = timed_out,
+                stdout=stdout[:65_536],
+                stderr=stderr[:8_192],
+                exit_code=exit_code,
+                time_ms=elapsed_ms,
+                memory_kb=memory_kb,
+                timed_out=timed_out,
             )
 
         except ImageNotFound:
-            lang  = config.image.replace("codequest-", "")
-            msg   = (
-                f"Docker image '{config.image}' not found.\n"
-                f"Build it:  docker build -t {config.image} ./languages/{lang}\n"
-                f"Or pull:   docker pull {config.image}"
-            )
+            lang = config.image.replace("codequest-", "")
+            msg = f"Docker image '{config.image}' not found. Build: docker build -t {config.image} ./languages/{lang}"
             logger.error(msg)
             return SandboxResult("", msg, 1, 0, None, False)
 
@@ -405,12 +434,12 @@ class Sandbox:
         finally:
             self._remove(container)
 
-
 # ─── Self-test ────────────────────────────────────────────────────────────────
 #
 # Run:   python sandbox.py
 # All 5 tests must pass before deploying the judge worker.
 #
+
 
 def _assert(condition: bool, label: str, result: SandboxResult):
     icon = "✅" if condition else "❌"
@@ -438,51 +467,51 @@ if __name__ == "__main__":
     # ── Test 1: Python — basic stdout ───────────────────────────────────────
     print("Test 1: Python basic stdout")
     r = sb.run("python", "print('hello world')\n", "")
-    _assert(r.success,                   "success=True",              r)
-    _assert("hello world" in r.stdout,   "stdout contains 'hello world'", r)
+    _assert(r.success, "success=True", r)
+    _assert("hello world" in r.stdout, "stdout contains 'hello world'", r)
     print(f"  ℹ  time={r.time_ms}ms  memory={r.memory_kb}KB\n")
 
     # ── Test 2: Python — stdin reading ──────────────────────────────────────
     print("Test 2: Python stdin reading")
     code = "import sys\nlines=sys.stdin.read().strip().split('\\n')\nprint(int(lines[0])+int(lines[1]))\n"
     r = sb.run("python", code, "3\n7")
-    _assert(r.success,          "success=True",          r)
-    _assert("10" in r.stdout,   "stdout contains '10'",  r)
+    _assert(r.success, "success=True", r)
+    _assert("10" in r.stdout, "stdout contains '10'", r)
     print(f"  ℹ  time={r.time_ms}ms\n")
 
     # ── Test 3: Python — runtime error ──────────────────────────────────────
     print("Test 3: Python runtime error")
     r = sb.run("python", "raise ValueError('boom')\n", "")
-    _assert(not r.success,         "success=False",          r)
-    _assert(r.exit_code != 0,      "exit_code != 0",         r)
-    _assert(not r.timed_out,       "timed_out=False",        r)
-    _assert("boom" in r.stderr,    "stderr contains 'boom'", r)
+    _assert(not r.success, "success=False", r)
+    _assert(r.exit_code != 0, "exit_code != 0", r)
+    _assert(not r.timed_out, "timed_out=False", r)
+    _assert("boom" in r.stderr, "stderr contains 'boom'", r)
     print(f"  ℹ  exit_code={r.exit_code}\n")
 
     # ── Test 4: Python — infinite loop (TLE) ────────────────────────────────
     print("Test 4: Python timeout (TLE) — this takes ~cpu_time_limit seconds …")
     sb_short = Sandbox(cpu_time_limit=3)
     r = sb_short.run("python", "while True: pass\n", "")
-    _assert(not r.success,   "success=False",    r)
-    _assert(r.timed_out,     "timed_out=True",   r)
+    _assert(not r.success, "success=False", r)
+    _assert(r.timed_out, "timed_out=True", r)
     print(f"  ℹ  time={r.time_ms}ms\n")
 
     # ── Test 5: C++ — compile + run ─────────────────────────────────────────
     print("Test 5: C++ compile + run")
     cpp_code = (
-        '#include <iostream>\n'
-        '#include <string>\n'
-        'int main(){\n'
-        '  int a,b; std::cin>>a>>b;\n'
-        '  std::cout<<a+b<<std::endl;\n'
-        '  return 0;\n'
-        '}\n'
+        "#include <iostream>\n"
+        "#include <string>\n"
+        "int main(){\n"
+        "  int a,b; std::cin>>a>>b;\n"
+        "  std::cout<<a+b<<std::endl;\n"
+        "  return 0;\n"
+        "}\n"
     )
     r = sb.run("cpp", cpp_code, "4\n6")
-    _assert(r.success,        "success=True",        r)
+    _assert(r.success, "success=True", r)
     _assert("10" in r.stdout, "stdout contains '10'", r)
     print(f"  ℹ  time={r.time_ms}ms\n")
 
-    print("="*50)
+    print("=" * 50)
     print("  ✅  All tests passed — sandbox ready")
-    print("="*50 + "\n")
+    print("=" * 50 + "\n")

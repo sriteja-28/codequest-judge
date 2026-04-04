@@ -47,15 +47,15 @@ def _post_callback(submission_id: str, payload: dict, retries: int = 3):
     logger.error("All %d callback attempts failed for submission %s", retries, submission_id)
 
 
-def _fetch_test_cases(problem_id: int) -> list[dict]:
+def _fetch_test_cases(problem_id: int, sample_only: bool = False) -> list[dict]:
     """
     Fetch test cases directly from the database.
     Falls back to the backend API if DB creds aren't available.
     """
-    return _fetch_test_cases_from_db(problem_id)
+    return _fetch_test_cases_from_db(problem_id,sample_only=sample_only)
 
 
-def _fetch_test_cases_from_db(problem_id: int) -> list[dict]:
+def _fetch_test_cases_from_db(problem_id: int, sample_only: bool = False) -> list[dict]:
     import psycopg2
     import dj_database_url
     from decouple import config as dconfig
@@ -74,15 +74,23 @@ def _fetch_test_cases_from_db(problem_id: int) -> list[dict]:
     )
     try:
         cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT id, input_data, expected_output, is_hidden
+
+        query = """
+            SELECT id, input_data, expected_output, is_hidden, is_sample
             FROM   test_cases
             WHERE  problem_id = %s
-            ORDER  BY order_index
-            """,
-            (problem_id,),
-        )
+            {} ORDER  BY order_index """.format("AND is_sample = TRUE" if sample_only else "") 
+
+        # cur.execute(
+        #     """
+        #     SELECT id, input_data, expected_output, is_hidden
+        #     FROM   test_cases
+        #     WHERE  problem_id = %s
+        #     ORDER  BY order_index
+        #     """,
+        #     (problem_id,), )
+        cur.execute(query, (problem_id,))
+       
         rows = cur.fetchall()
         return [
             {"id": r[0], "input_data": r[1], "expected_output": r[2], "is_hidden": r[3]}
@@ -123,6 +131,7 @@ def run_submission(
     language:      str,
     code:          str,
     stop_on_fail:  bool = True,
+    run_sample:    bool = False, 
 ) -> None:
     """
     Run all test cases for a submission and POST results to the backend.
@@ -137,7 +146,7 @@ def run_submission(
 
     # Fetch test cases
     try:
-        test_cases = _fetch_test_cases(problem_id)
+        test_cases = _fetch_test_cases(problem_id, sample_only=run_sample)
     except Exception as exc:
         logger.error("Failed to fetch test cases: %s", exc)
         _post_callback(submission_id, {
@@ -170,6 +179,14 @@ def run_submission(
     for tc in test_cases:
         result: SandboxResult = sandbox.run(language, code, tc["input_data"])
 
+
+        # adding debug logs here
+        logger.debug("----- Test Case Debug -----")
+        logger.debug("INPUT: %s", tc["input_data"])
+        logger.debug("EXPECTED: %s", repr(tc["expected_output"]))
+        logger.debug("GOT: %s", repr(result.stdout))
+        logger.debug("---------------------------")
+
         # Determine per-testcase status
         if result.compile_error:
             tc_status = "COMPILE_ERROR"
@@ -179,6 +196,7 @@ def run_submission(
             tc_status = "MEMORY_LIMIT"
         elif result.exit_code != 0:
             tc_status = "RUNTIME_ERROR"
+            
         elif compare(result.stdout, tc["expected_output"]):
             tc_status = "ACCEPTED"
         else:
