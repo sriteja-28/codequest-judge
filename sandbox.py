@@ -27,8 +27,7 @@ Execution model:
 Security layers:
   - No network  (--network none)
   - Read-only root filesystem  (--read-only)
-  - Writable /tmp tmpfs only — noexec so compiled output can't be directly exec'd
-    (compilers write to /tmp but execution is via the runtime interpreter/JVM)
+  - Writable /tmp tmpfs only — compiled binaries execute from /tmp
   - Hard memory cap with swap disabled (mem == memswap)
   - PID limit — prevents fork-bombs
   - Non-root user (nobody)
@@ -46,6 +45,7 @@ from __future__ import annotations
 import logging
 import os
 import platform
+import re
 import sys
 import tempfile
 import time
@@ -86,10 +86,11 @@ SECCOMP_PROFILE = _HERE / "seccomp_default.json"
 #
 @dataclass
 class LanguageConfig:
-    image: str  # Docker image tag to use
-    filename: str  # Name to save the user's code as
+    image: str          # Docker image tag to use
+    filename: str       # Name to save the user's code as
     compile_cmd: Optional[str]  # Shell command to compile (None for interpreted)
-    run_cmd: str  # Shell command to run (always reads from /code/stdin.txt)
+    run_cmd: str        # Shell command to run (always reads from /code/stdin.txt)
+    chmod_cmd: Optional[str] = None  # chmod to run after compile so nobody can exec output
     version_cmd: str = "echo unknown"  # Used in health checks / build verification
 
 
@@ -104,12 +105,9 @@ LANGUAGE_CONFIG: dict[str, LanguageConfig] = {
     "cpp": LanguageConfig(
         image="codequest-cpp",
         filename="solution.cpp",
-        # Compile into /tmp (writable tmpfs) — NOT /code (read-only mount)
-        # compile_cmd = "g++ -O2 -std=c++17 -Wall -o /tmp/sol /code/solution.cpp",
-        # run_cmd     = "/tmp/sol < /code/stdin.txt",
-        compile_cmd="g++ -O2 -std=c++17 -Wall -o /code/sol /code/solution.cpp",
-        run_cmd="/code/sol < /code/stdin.txt",
-
+        compile_cmd="g++ -O2 -std=c++17 -Wall -o /tmp/sol /code/solution.cpp",
+        chmod_cmd="chmod +x /tmp/sol",
+        run_cmd="/tmp/sol < /code/stdin.txt",
         version_cmd="g++ --version",
     ),
     "java": LanguageConfig(
@@ -171,7 +169,7 @@ class Sandbox:
 
     def __init__(
         self,
-        cpu_time_limit: int = 10,  # wall-clock seconds per execution phase
+        cpu_time_limit: int = 10,   # wall-clock seconds per execution phase
         memory_limit_mb: int = 256,
     ):
         self.cpu_time_limit = cpu_time_limit
@@ -252,19 +250,24 @@ class Sandbox:
             "volumes": {
                 # os.path.abspath is required on Windows where Docker Desktop
                 # needs a proper drive-letter path (e.g. C:\Users\...)
-                # os.path.abspath(code_dir): {"bind": "/code", "mode": "ro"},
-                os.path.abspath(code_dir): {"bind": "/code", "mode": "rw"},
+                # FIX #1 (cont): Volume is now "ro" again. The compiled binary
+                # lives in /tmp (tmpfs) inside the container, not in /code.
+                os.path.abspath(code_dir): {"bind": "/code", "mode": "ro"},
             },
-            "stdin_open": False,  # stdin via file redirect
+            "stdin_open": False,        # stdin via file redirect
             "detach": True,
-            "network_disabled": True,  # no internet inside container
-            "read_only": True,  # immutable root fs
-            # "tmpfs":            {"/tmp": "size=128m,noexec"},  # compiler scratch space
-            "tmpfs": {"/tmp": "size=128m"},
+            "network_disabled": True,   # no internet inside container
+            "read_only": True,          # immutable root fs
+            # exec is required: Docker Desktop (Windows/macOS) mounts tmpfs
+            # with noexec by default, which prevents the compiled binary from
+            # running even after chmod +x. Explicitly passing exec overrides it.
+            "tmpfs": {"/tmp": "size=128m,exec"},
             "mem_limit": f"{self.memory_limit_mb}m",
             "memswap_limit": f"{self.memory_limit_mb}m",  # disable swap
-            "pids_limit": 64,  # kill fork-bombs
-            "user": "nobody",  # non-root
+            "pids_limit": 64,           # kill fork-bombs
+            # user is set per-phase in _run_phase:
+            #   compile → root  (needs to write binary to /tmp)
+            #   run     → nobody (untrusted user code must not run as root)
         }
 
         # Seccomp profile — Linux production only
@@ -315,6 +318,27 @@ class Sandbox:
         except Exception:
             return None
 
+    def _collect_memory_from_file(self, code_dir: str) -> Optional[int]:
+        """
+        FIX #5: This method was called in _run_phase but never defined,
+        causing an AttributeError on any non-Linux host.
+
+        Parses the 'Maximum resident set size' line written by
+        `/usr/bin/time -v` (GNU time) into the time_stats.txt file.
+        Returns KB, or None if the file is absent or unparseable
+        (e.g. BusyBox time on Alpine, or macOS Docker Desktop).
+        """
+        stats_file = Path(code_dir) / "time_stats.txt"
+        if not stats_file.exists():
+            return None
+        try:
+            text = stats_file.read_text(errors="replace")
+            # GNU time outputs: "\tMaximum resident set size (kbytes): 12345"
+            match = re.search(r"Maximum resident set size \(kbytes\):\s*(\d+)", text)
+            return int(match.group(1)) if match else None
+        except Exception:
+            return None
+
     def _remove(self, container: Optional[Container]):
         if container:
             try:
@@ -324,24 +348,29 @@ class Sandbox:
 
     def _execute(self, config: LanguageConfig, code_dir: str) -> SandboxResult:
         """
-        Two-phase execution for compiled languages, one-phase for interpreted.
+        Two-container strategy for compiled languages:
 
-        Phase 1 (compiled only): Compile — produces a binary in /tmp
-        Phase 2: Run — executes binary/interpreter with stdin redirect
+        Container 1 — compile only, runs as root.
+          Root is required because Docker mounts the /tmp tmpfs as root:root
+          755, and the compiler must write the binary there. Stderr flows into
+          Docker logs so we can read it after exit. On failure → compile_error.
 
-        Separating phases gives the frontend a clear "Compile Error" status
-        distinct from "Runtime Error".
+        Container 2 — compile+run, also starts as root.
+          Recompiles (fast; code already verified above), then uses
+          `su -s /bin/sh nobody` to drop privileges before executing the
+          binary. Untrusted user code never runs as root.
+          On failure → runtime error.
+
+        Interpreted languages skip both and use a single run container as nobody.
         """
 
-        # ── Phase 1: Compile (C++, Java) ────────────────────────────────────
         if config.compile_cmd:
+            # Phase 1: compile only — stderr flows naturally into Docker logs
+            # so we can read it after the container exits.
             compile_result = self._run_phase(
-                config=config,
-                code_dir=code_dir,
-                cmd=config.compile_cmd,
-                phase="compile",
+                config, code_dir, config.compile_cmd, "compile"
             )
-            if not compile_result.success:
+            if compile_result.exit_code != 0 or compile_result.timed_out:
                 return SandboxResult(
                     stdout="",
                     stderr=compile_result.stderr,
@@ -352,30 +381,56 @@ class Sandbox:
                     compile_error=True,
                     compile_stderr=compile_result.stderr,
                 )
-            # For compiled languages, the compile container produced /tmp/sol
-            # but /tmp is inside the container — not accessible from the host.
-            # We need a SINGLE container that does both compile + run.
-            # Switch to combined command:
-            combined_cmd = f"{config.compile_cmd} && {config.run_cmd}"
-            return self._run_phase(config, code_dir, combined_cmd, "compile+run")
 
-        # ── Phase 2: Run (interpreted or already compiled above) ────────────
+            # Phase 2: single combined container — compile (as root, writes to
+            # /tmp) then immediately re-exec the binary as nobody so untrusted
+            # user code never runs with elevated privileges.
+            # Build the combined command: compile → optional chmod → run-as-nobody.
+            # chmod is needed for binary outputs (C++) so that nobody can exec
+            # the file that root just wrote. Java .class files are read by the
+            # JVM so they don't need +x.
+            parts = [config.compile_cmd]
+            if config.chmod_cmd:
+                parts.append(config.chmod_cmd)
+            parts.append(f"su -s /bin/sh nobody -c '{config.run_cmd}'")
+            combined_cmd = " && ".join(parts)
+            # Override user back to root for this container so the compile
+            # step can write to /tmp; the su above drops to nobody for run.
+            result = self._run_phase(config, code_dir, combined_cmd, "compile+run")
+            # Force user=root for compile+run (su handles the drop inside)
+            return result
+
+        # Interpreted languages — single run phase only.
         return self._run_phase(config, code_dir, config.run_cmd, "run")
 
-    def _run_phase( self,
+    def _run_phase(
+        self,
         config: LanguageConfig,
         code_dir: str,
         cmd: str,
-        phase: str,):
+        phase: str,
+    ) -> SandboxResult:
         start_time = time.monotonic()
         container = None
 
         try:
             kwargs = self._base_container_kwargs(config, code_dir)
 
-            # For run phase, use wrapper to capture memory cross-platform
-            if phase == "run":
-                actual_cmd = f"/usr/bin/time -v sh -c \"{cmd}\" 2>/code/time_stats.txt"
+            # Compile phase runs as root so it can write the binary to /tmp
+            # (Docker mounts tmpfs as root:root 755 — nobody can't write to it).
+            # Run phase always executes as nobody — untrusted user code must
+            # never run as root regardless of platform.
+            # compile+run also starts as root; the combined command uses `su`
+            # to drop to nobody before executing the compiled binary.
+            if phase in ("compile", "compile+run"):
+                kwargs["user"] = "root"
+            else:
+                kwargs["user"] = "nobody"
+
+            # FIX #3: `/usr/bin/time -v` is GNU-only and breaks on Alpine/macOS.
+            # Use it only on Linux; fall back to Docker stats (or None) elsewhere.
+            if phase in ("run", "compile+run") and IS_LINUX:
+                actual_cmd = f'/usr/bin/time -v sh -c "{cmd}" 2>/code/time_stats.txt'
             else:
                 actual_cmd = cmd
 
@@ -385,21 +440,25 @@ class Sandbox:
             exit_code, timed_out = self._wait_container(container, phase)
             elapsed_ms = int((time.monotonic() - start_time) * 1000)
 
-            # Try Docker stats first (Linux), fall back to time file (Windows/macOS)
+            # Memory: try Docker stats first (works on Linux cgroup v2),
+            # fall back to the GNU time output file (Linux only),
+            # otherwise None (Windows/macOS Docker Desktop).
             memory_kb = self._collect_stats(container)
             if not memory_kb:
+                # FIX #5: method now exists; safe to call on all platforms.
                 memory_kb = self._collect_memory_from_file(code_dir)
 
             stdout = container.logs(stdout=True, stderr=False).decode("utf-8", errors="replace")
-            # stderr is now in time_stats.txt for run phase, still in logs for compile
-            if phase in ("run", "compile+run"):
+
+            if phase in ("run", "compile+run") and IS_LINUX:
+                # GNU time wrote real stderr + timing lines to time_stats.txt.
+                # Strip the timing lines; keep only actual program stderr.
                 stderr_file = Path(code_dir) / "time_stats.txt"
                 try:
                     raw_stderr = stderr_file.read_text(errors="replace") if stderr_file.exists() else ""
-                    # Strip the /usr/bin/time lines, keep only actual stderr
                     stderr = "\n".join(
-                        l for l in raw_stderr.splitlines()
-                        if not any(k in l for k in [
+                        line for line in raw_stderr.splitlines()
+                        if not any(k in line for k in [
                             "Command being timed", "Maximum resident", "Elapsed",
                             "Percent of CPU", "Major (requiring", "Minor (reclaiming",
                             "Voluntary context", "Involuntary context", "File system",
@@ -423,7 +482,10 @@ class Sandbox:
 
         except ImageNotFound:
             lang = config.image.replace("codequest-", "")
-            msg = f"Docker image '{config.image}' not found. Build: docker build -t {config.image} ./languages/{lang}"
+            msg = (
+                f"Docker image '{config.image}' not found. "
+                f"Build: docker build -t {config.image} ./languages/{lang}"
+            )
             logger.error(msg)
             return SandboxResult("", msg, 1, 0, None, False)
 
@@ -433,6 +495,7 @@ class Sandbox:
 
         finally:
             self._remove(container)
+
 
 # ─── Self-test ────────────────────────────────────────────────────────────────
 #
@@ -511,6 +574,15 @@ if __name__ == "__main__":
     _assert(r.success, "success=True", r)
     _assert("10" in r.stdout, "stdout contains '10'", r)
     print(f"  ℹ  time={r.time_ms}ms\n")
+
+    # ── Test 6: C++ — compile error ─────────────────────────────────────────
+    print("Test 6: C++ compile error")
+    bad_cpp = "int main() { this is not valid c++; }\n"
+    r = sb.run("cpp", bad_cpp, "")
+    _assert(not r.success, "success=False", r)
+    _assert(r.compile_error, "compile_error=True", r)
+    _assert(not r.timed_out, "timed_out=False", r)
+    print(f"  ℹ  compile_stderr={r.compile_stderr[:80]!r}\n")
 
     print("=" * 50)
     print("  ✅  All tests passed — sandbox ready")
