@@ -1,43 +1,42 @@
 """
-sandbox.py — Production-grade code execution sandbox.
+sandbox.py — Docker-based code execution sandbox for the CodeQuest judge.
 
-Works identically on:
-  ✅ Windows  — Docker Desktop (named pipes, no raw socket access)
-  ✅ macOS    — Docker Desktop / Colima
-  ✅ Linux    — Docker Engine (CI, staging, production)
-  ✅ Cloud    — ECS, GKE, K8s (privileged or sysbox nodes)
+Execution model
+---------------
+1. prepare(language, code)
+     Writes the source into a fresh work dir and, for compiled languages
+     (C++, Java), compiles ONCE in a short-lived container into /build.
+2. execute(prepared, stdin)   (once per test case)
+     Starts a fresh container per test case with /code and /build mounted
+     read-only, feeds stdin from /code/stdin.txt and measures the program
+     *inside* the container (run time excludes container start-up).
+3. cleanup(prepared)
+     Removes the work dir.
+`run(language, code, stdin)` = prepare + execute + cleanup (one-shot API).
 
-Architecture
-------------
-Stdin delivery: written to a file in the mounted temp directory and
-redirected with shell `< /code/stdin.txt`. This is the only approach
-that works reliably on Windows Docker Desktop, where attach_socket
-returns a named-pipe wrapper whose .send() silently fails on some
-versions, causing stdin-dependent code to block until the wall-clock
-timeout fires.
+Isolation (each container)
+--------------------------
+  - runs as uid/gid 65534 (nobody) — never root, no `su`
+  - no network, read-only root filesystem, all capabilities dropped,
+    no-new-privileges, PID limit, memory limit with swap disabled, CPU quota
+  - only writable path is a size-limited tmpfs /tmp (mode 1777)
+  - stdout/stderr are captured to tmpfs and truncated (64 KB / 8 KB) before
+    they reach the Docker log, so output floods cannot exhaust the worker
+  - optional seccomp profile (seccomp_default.json next to this file, Linux)
 
-Execution model:
-  1. Write code + stdin to an OS temp dir (one per submission, deleted after)
-  2. Mount that dir read-only into a fresh container
-  3. For compiled languages (C++, Java), compile first, then run — separate
-     stderr streams let us distinguish compile errors from runtime errors
-  4. Wait with a hard wall-clock timeout; kill on breach
-  5. Collect stdout/stderr/stats; remove the container in a finally block
+Containers are a mitigation, not a complete security boundary: the worker
+talks to the Docker daemon (root-equivalent on the host). Run workers on
+dedicated hosts/VMs; consider gVisor (runsc) or Kata for stronger isolation.
 
-Security layers:
-  - No network  (--network none)
-  - Read-only root filesystem  (--read-only)
-  - Writable /tmp tmpfs only — compiled binaries execute from /tmp
-  - Hard memory cap with swap disabled (mem == memswap)
-  - PID limit — prevents fork-bombs
-  - Non-root user (nobody)
-  - Container auto-removed on exit
-
-Production hardening (add when running on Linux production nodes):
-  - Mount a seccomp profile: see SECCOMP_PROFILE_PATH below
-  - Use gVisor (runsc) or Kata Containers for kernel-level isolation
-  - Run judge workers on dedicated node group isolated from API nodes
-  - Set Docker daemon's default ulimits (nproc, nofile) at the host level
+Limits/semantics
+----------------
+  cpu_time_limit   wall-clock seconds per test case, enforced in-container by
+                   coreutils `timeout` (single CPU by default, so wall ≈ CPU)
+  memory_limit_mb  container memory cap for the run phase (MLE on OOM kill or
+                   language OOM errors such as java.lang.OutOfMemoryError)
+  time_ms          program wall time measured inside the container
+  memory_kb        container cgroup peak (memory.peak / max_usage_in_bytes);
+                   None when the kernel does not expose it
 """
 
 from __future__ import annotations
@@ -46,16 +45,17 @@ import logging
 import os
 import platform
 import re
+import shutil
 import sys
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import docker
-from docker.errors import APIError, ContainerError, ImageNotFound, NotFound
-from docker.models.containers import Container
+from docker.errors import APIError, DockerException, ImageNotFound
+from docker.types import LogConfig
 
 logger = logging.getLogger(__name__)
 
@@ -65,70 +65,89 @@ IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
 
 # ─── Optional seccomp profile (Linux production only) ────────────────────────
-#
-# Drop this file next to sandbox.py in production:
+# Drop moby's default profile (or a stricter one) next to this file:
 #   https://github.com/moby/moby/blob/master/profiles/seccomp/default.json
-# Restricts ~300 Linux syscalls to the minimum needed for code execution.
-# Ignored on Windows/macOS (Docker Desktop handles isolation differently).
-#
+# Docker already applies its default profile when none is given.
 _HERE = Path(__file__).parent
 SECCOMP_PROFILE = _HERE / "seccomp_default.json"
 
+SANDBOX_USER = "65534:65534"  # nobody:nogroup in the Debian/Ubuntu base images
+STATS_MARKER = "__CQ_STATS__"
+MAX_STDOUT_BYTES = 65_536
+MAX_STDERR_BYTES = 8_192
+MAX_COMPILE_OUTPUT_BYTES = 16_384
+HOST_GRACE_SECONDS = 15  # host-side backstop on top of the in-container limit
+SANDBOX_LABEL = {"codequest.sandbox": "1"}
+
+# Base dir for each run's payload (source, stdin, wrapper scripts). The worker
+# bind-mounts it into the language containers, and the Docker daemon resolves
+# bind sources on the HOST — so when the worker itself runs in a container
+# (infra/docker-compose.prod.yml), this must be a directory the host can see
+# at the same path; compose mounts it accordingly (SANDBOX_DIR /
+# SANDBOX_HOST_DIR in infra/.env.production.example). Unset → system temp dir,
+# which is correct when the worker runs directly on the host (dev).
+SANDBOX_DIR = os.environ.get("SANDBOX_DIR") or None
+if SANDBOX_DIR:
+    os.makedirs(SANDBOX_DIR, exist_ok=True)
+
 
 # ─── Language configuration ───────────────────────────────────────────────────
-#
-# Design rules:
-#   1. Always redirect stdin from /code/stdin.txt — cross-platform compatible
-#   2. Compiled languages use a two-phase approach (compile → run) so compile
-#      errors are reported separately from runtime errors
-#   3. All output written to stdout; stderr captured separately
-#   4. No network calls possible inside the container
-#
-@dataclass
+
+@dataclass(frozen=True)
 class LanguageConfig:
-    image: str          # Docker image tag to use
-    filename: str       # Name to save the user's code as
-    compile_cmd: Optional[str]  # Shell command to compile (None for interpreted)
-    run_cmd: str        # Shell command to run (always reads from /code/stdin.txt)
-    chmod_cmd: Optional[str] = None  # chmod to run after compile so nobody can exec output
-    version_cmd: str = "echo unknown"  # Used in health checks / build verification
+    image: str                      # Docker image tag (judge/languages/<dir>)
+    filename: str                   # source file name inside /code
+    compile_cmd: Optional[str]      # writes artefacts to /build (None = interpreted)
+    run_cmd: str                    # program command; stdin is redirected by the wrapper
+    pre_run_cmd: Optional[str] = None   # untimed setup before the program starts
+    version_cmd: str = "echo unknown"
+    oom_markers: tuple = ()         # stderr fragments meaning "out of memory"
+    build_dir: str = ""             # judge/languages/<dir> (for error messages)
 
 
 LANGUAGE_CONFIG: dict[str, LanguageConfig] = {
     "python": LanguageConfig(
         image="codequest-python",
         filename="solution.py",
-        compile_cmd=None,  # interpreted — no compile step
-        run_cmd="python3 -u /code/solution.py < /code/stdin.txt",
+        compile_cmd=None,
+        run_cmd="python3 -u /code/solution.py",
         version_cmd="python3 --version",
+        oom_markers=("MemoryError",),
+        build_dir="python",
     ),
     "cpp": LanguageConfig(
         image="codequest-cpp",
         filename="solution.cpp",
-        compile_cmd="g++ -O2 -std=c++17 -Wall -o /tmp/sol /code/solution.cpp",
-        chmod_cmd="chmod +x /tmp/sol",
-        run_cmd="/tmp/sol < /code/stdin.txt",
+        compile_cmd="g++ -O2 -std=c++17 -Wall -o /build/sol /code/solution.cpp",
+        # Copy to the exec-enabled tmpfs: host temp dirs may be mounted noexec.
+        pre_run_cmd="cp /build/sol /tmp/sol",
+        run_cmd="/tmp/sol",
         version_cmd="g++ --version",
+        oom_markers=("std::bad_alloc",),
+        build_dir="cpp",
     ),
     "java": LanguageConfig(
         image="codequest-java",
         filename="Solution.java",
-        compile_cmd="javac /code/Solution.java -d /tmp",
-        run_cmd="java -cp /tmp -Xmx200m Solution < /code/stdin.txt",
+        compile_cmd="javac -encoding UTF-8 -d /build /code/Solution.java",
+        run_cmd="java -Xmx200m -XX:+UseSerialGC -XX:-UsePerfData -cp /build Solution",
         version_cmd="java --version",
+        oom_markers=("java.lang.OutOfMemoryError",),
+        build_dir="java",
     ),
     "javascript": LanguageConfig(
         image="codequest-js",
         filename="solution.js",
         compile_cmd=None,
-        run_cmd="node --max-old-space-size=200 /code/solution.js < /code/stdin.txt",
+        run_cmd="node --max-old-space-size=200 /code/solution.js",
         version_cmd="node --version",
+        oom_markers=("JavaScript heap out of memory",),
+        build_dir="javascript",
     ),
 }
 
 
-# ─── Result dataclass ─────────────────────────────────────────────────────────
-
+# ─── Result types ─────────────────────────────────────────────────────────────
 
 @dataclass
 class SandboxResult:
@@ -143,447 +162,405 @@ class SandboxResult:
     compile_error: bool = False
     compile_stderr: str = ""
 
+    memory_exceeded: bool = False   # OOM kill or language-level OOM error
+    output_exceeded: bool = False   # stdout larger than MAX_STDOUT_BYTES
+    infra_error: bool = False       # Docker/image problem — not the user's fault
+
     @property
     def success(self) -> bool:
-        return self.exit_code == 0 and not self.timed_out and not self.compile_error
+        return (
+            self.exit_code == 0 and not self.timed_out and not self.compile_error
+            and not self.memory_exceeded and not self.output_exceeded and not self.infra_error
+        )
 
     def __repr__(self) -> str:
         return (
-            f"<SandboxResult success={self.success} "
-            f"exit={self.exit_code} time={self.time_ms}ms "
-            f"timed_out={self.timed_out} compile_error={self.compile_error}>"
+            f"<SandboxResult success={self.success} exit={self.exit_code} time={self.time_ms}ms "
+            f"mem={self.memory_kb}KB timed_out={self.timed_out} compile_error={self.compile_error} "
+            f"mle={self.memory_exceeded} ole={self.output_exceeded} infra={self.infra_error}>"
         )
 
 
-# ─── Sandbox class ────────────────────────────────────────────────────────────
+@dataclass
+class Prepared:
+    language: str
+    config: LanguageConfig
+    workdir: str
+    code_dir: str
+    build_dir: str
+    compile_result: Optional[SandboxResult] = None  # set when compilation failed
 
+    @property
+    def ok(self) -> bool:
+        return self.compile_result is None
+
+
+def _infra_result(message: str) -> SandboxResult:
+    return SandboxResult("", message, 1, 0, None, False, infra_error=True)
+
+
+# ─── Wrapper scripts (POSIX sh, executed by /bin/sh inside the container) ────
+
+def _run_script(config: LanguageConfig, limit_s: int) -> str:
+    pre = f"{config.pre_run_cmd} || exit 98\n" if config.pre_run_cmd else ""
+    return (
+        "#!/bin/sh\n"
+        f"{pre}"
+        "s=$(date +%s%N)\n"
+        f"timeout -k 1 {limit_s}s {config.run_cmd} < /code/stdin.txt > /tmp/out.txt 2> /tmp/err.txt\n"
+        "rc=$?\n"
+        "e=$(date +%s%N)\n"
+        "m=$(cat /sys/fs/cgroup/memory.peak 2>/dev/null || cat /sys/fs/cgroup/memory/memory.max_usage_in_bytes 2>/dev/null || echo -)\n"
+        "ob=$(wc -c < /tmp/out.txt)\n"
+        f"head -c {MAX_STDOUT_BYTES} /tmp/out.txt\n"
+        f"head -c {MAX_STDERR_BYTES} /tmp/err.txt >&2\n"
+        f"printf '\\n{STATS_MARKER} rc=%s ns=%s mem=%s out=%s\\n' \"$rc\" \"$((e - s))\" \"$m\" \"$ob\" >&2\n"
+        "exit $rc\n"
+    )
+
+
+def _compile_script(config: LanguageConfig, limit_s: int) -> str:
+    return (
+        "#!/bin/sh\n"
+        "umask 000\n"  # artefacts must stay deletable by the (non-root) worker
+        f"timeout -k 1 {limit_s}s {config.compile_cmd} > /tmp/compile.txt 2>&1\n"
+        "rc=$?\n"
+        f"head -c {MAX_COMPILE_OUTPUT_BYTES} /tmp/compile.txt\n"
+        "exit $rc\n"
+    )
+
+
+_STATS_RE = re.compile(
+    rf"^{STATS_MARKER} rc=(?P<rc>-?\d+) ns=(?P<ns>-?\d+) mem=(?P<mem>\S*) out=\s*(?P<out>\d+)\s*$"
+)
+
+
+def _split_stats(stderr: str):
+    """Remove the wrapper's stats line (the last one; a program could print a
+    fake marker earlier) from stderr. Returns (stderr, stats | None)."""
+    idx = stderr.rfind(f"{STATS_MARKER} rc=")
+    if idx < 0:
+        return stderr, None
+    match = _STATS_RE.match(stderr[idx:])
+    if not match:
+        return stderr, None
+    clean = stderr[:idx]
+    if clean.endswith("\n"):
+        clean = clean[:-1]
+    stats = {
+        "rc": int(match.group("rc")),
+        "ns": int(match.group("ns")),
+        "mem": int(match.group("mem")) if match.group("mem").isdigit() else None,
+        "out": int(match.group("out")),
+    }
+    return clean, stats
+
+
+# ─── Sandbox ──────────────────────────────────────────────────────────────────
 
 class Sandbox:
     """
-    Stateless executor — one instance per worker process is fine.
-    Each call to .run() spins up a fresh container and removes it after.
-
-    Horizontal scaling: run N worker processes; each gets its own Sandbox
-    instance. Docker handles concurrency at the container level.
+    One instance per worker process is fine; every execution uses a fresh
+    container. Constructor arguments keep the original signature.
     """
 
     def __init__(
         self,
-        cpu_time_limit: int = 10,   # wall-clock seconds per execution phase
+        cpu_time_limit: int = 10,       # seconds per test case
         memory_limit_mb: int = 256,
+        compile_time_limit: Optional[int] = None,
+        compile_memory_limit_mb: Optional[int] = None,
+        cpus: Optional[float] = None,
     ):
-        self.cpu_time_limit = cpu_time_limit
-        self.memory_limit_mb = memory_limit_mb
+        self.cpu_time_limit = int(cpu_time_limit)
+        self.memory_limit_mb = int(memory_limit_mb)
+        self.compile_time_limit = int(compile_time_limit or os.environ.get("COMPILE_TIME_LIMIT", 30))
+        self.compile_memory_limit_mb = int(compile_memory_limit_mb or os.environ.get("COMPILE_MEMORY_LIMIT_MB", 512))
+        self.cpus = float(cpus or os.environ.get("JUDGE_CPUS", 1.0))
         self.client = docker.from_env()
         self._log_env()
 
     def _log_env(self):
         info = self.client.info()
         logger.info(
-            "Docker connected: %s | OS: %s | Arch: %s",
-            info.get("ServerVersion", "?"),
-            info.get("OSType", "?"),
-            info.get("Architecture", "?"),
+            "Docker connected: %s | OS: %s | Arch: %s | cgroup v%s",
+            info.get("ServerVersion", "?"), info.get("OSType", "?"),
+            info.get("Architecture", "?"), info.get("CgroupVersion", "?"),
         )
 
     # ── Public API ──────────────────────────────────────────────────────────
 
     def run(self, language: str, code: str, stdin_data: str) -> SandboxResult:
-        """
-        Execute user code against one test case.
+        """One-shot execution (compile + single run). Never raises."""
+        prepared = self.prepare(language, code)
+        try:
+            if isinstance(prepared, SandboxResult):
+                return prepared
+            if not prepared.ok:
+                return prepared.compile_result
+            return self.execute(prepared, stdin_data)
+        finally:
+            if not isinstance(prepared, SandboxResult):
+                self.cleanup(prepared)
 
-        Parameters
-        ----------
-        language   : one of "python", "cpp", "java", "javascript"
-        code       : user-submitted source code (UTF-8 string)
-        stdin_data : test case input (may be empty string)
-
-        Returns
-        -------
-        SandboxResult — always returns (never raises); all errors are
-        captured in the result fields.
-        """
+    def prepare(self, language: str, code: str):
+        """Write the source and compile it once. Returns a Prepared handle, or a
+        SandboxResult describing an unsupported language / infrastructure error.
+        A compile failure is reported via Prepared.compile_result."""
         config = LANGUAGE_CONFIG.get(language)
         if config is None:
             supported = ", ".join(LANGUAGE_CONFIG)
-            return SandboxResult(
-                stdout="",
-                stderr=f"Unsupported language '{language}'. Supported: {supported}",
-                exit_code=1,
-                time_ms=0,
-                memory_kb=None,
-                timed_out=False,
-            )
+            return SandboxResult("", f"Unsupported language '{language}'. Supported: {supported}", 1, 0, None, False)
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            self._write_files(tmpdir, config, code, stdin_data)
-            return self._execute(config, tmpdir)
+        workdir = tempfile.mkdtemp(prefix="cq-judge-", dir=SANDBOX_DIR)
+        code_dir = os.path.join(workdir, "code")
+        build_dir = os.path.join(workdir, "build")
+        os.makedirs(code_dir)
+        os.makedirs(build_dir)
+        Path(code_dir, config.filename).write_text(code, encoding="utf-8")
+        Path(code_dir, "stdin.txt").write_text("", encoding="utf-8")
+        Path(code_dir, ".cq_run.sh").write_text(_run_script(config, self.cpu_time_limit), encoding="utf-8", newline="\n")
+        if config.compile_cmd:
+            Path(code_dir, ".cq_compile.sh").write_text(
+                _compile_script(config, self.compile_time_limit), encoding="utf-8", newline="\n"
+            )
+        # tempfile creates 0700 dirs; the sandbox user (65534) must be able to
+        # read /code and write /build on Linux hosts.
+        os.chmod(workdir, 0o755)
+        os.chmod(code_dir, 0o755)
+        os.chmod(build_dir, 0o777)
+        for name in os.listdir(code_dir):
+            os.chmod(os.path.join(code_dir, name), 0o644)
+
+        prepared = Prepared(language, config, workdir, code_dir, build_dir)
+        if config.compile_cmd:
+            result = self._compile(prepared)
+            if result is not None:
+                prepared.compile_result = result
+        return prepared
+
+    def execute(self, prepared: Prepared, stdin_data: str) -> SandboxResult:
+        """Run the prepared program against one input. Never raises."""
+        if not prepared.ok:
+            return prepared.compile_result
+        Path(prepared.code_dir, "stdin.txt").write_text(stdin_data or "", encoding="utf-8")
+        return self._run(prepared)
+
+    def cleanup(self, prepared: Prepared) -> None:
+        shutil.rmtree(prepared.workdir, ignore_errors=True)
+        if os.path.exists(prepared.workdir):
+            logger.warning("Could not fully remove sandbox work dir %s", prepared.workdir)
 
     def health_check(self, language: str = "python") -> bool:
-        """
-        Verify the sandbox can run a trivial program.
-        Called by the worker on startup and periodically.
-        """
-        result = self.run(language, "print('ok')\n", "")
-        ok = result.success and "ok" in result.stdout
+        programs = {
+            "python": "print('ok')\n",
+            "javascript": "console.log('ok')\n",
+            "cpp": "#include <cstdio>\nint main(){std::puts(\"ok\");}\n",
+            "java": "public class Solution{public static void main(String[] a){System.out.println(\"ok\");}}\n",
+        }
+        result = self.run(language, programs[language], "")
+        ok = result.success and result.stdout.strip() == "ok"
         if not ok:
-            logger.error("Sandbox health check FAILED for %s: %r", language, result)
+            logger.error("Sandbox health check FAILED for %s: %r %s", language, result, result.stderr[:300])
         return ok
 
-    # ── File setup ──────────────────────────────────────────────────────────
+    # ── Container plumbing ──────────────────────────────────────────────────
 
-    @staticmethod
-    def _write_files(tmpdir: str, config: LanguageConfig, code: str, stdin_data: str):
-        Path(tmpdir, config.filename).write_text(code, encoding="utf-8")
-        Path(tmpdir, "stdin.txt").write_text(stdin_data or "", encoding="utf-8")
-
-    # ── Container execution ─────────────────────────────────────────────────
-
-    def _base_container_kwargs(self, config: LanguageConfig, code_dir: str) -> dict:
-        """
-        Build Docker container kwargs.
-        Shared between compile and run phases.
-        Security settings are always applied.
-        """
+    def _container_kwargs(self, prepared: Prepared, *, build_mode: str, memory_mb: int,
+                          tmpfs_opts: str, pids: int, script: str) -> dict:
         kwargs: dict = {
-            "image": config.image,
+            "image": prepared.config.image,
+            "command": ["/bin/sh", f"/code/{script}"],
+            "user": SANDBOX_USER,
+            "working_dir": "/tmp",
+            "environment": {"HOME": "/tmp", "TMPDIR": "/tmp"},
             "volumes": {
-                # os.path.abspath is required on Windows where Docker Desktop
-                # needs a proper drive-letter path (e.g. C:\Users\...)
-                # FIX #1 (cont): Volume is now "ro" again. The compiled binary
-                # lives in /tmp (tmpfs) inside the container, not in /code.
-                os.path.abspath(code_dir): {"bind": "/code", "mode": "ro"},
+                os.path.abspath(prepared.code_dir): {"bind": "/code", "mode": "ro"},
+                os.path.abspath(prepared.build_dir): {"bind": "/build", "mode": build_mode},
             },
-            "stdin_open": False,        # stdin via file redirect
+            "tmpfs": {"/tmp": tmpfs_opts},
+            "read_only": True,
+            "network_disabled": True,
+            "mem_limit": f"{memory_mb}m",
+            "memswap_limit": f"{memory_mb}m",  # no swap
+            "nano_cpus": int(self.cpus * 1_000_000_000),
+            "pids_limit": pids,
+            "cap_drop": ["ALL"],
+            "security_opt": ["no-new-privileges:true"],
+            "stdin_open": False,
             "detach": True,
-            "network_disabled": True,   # no internet inside container
-            "read_only": True,          # immutable root fs
-            # exec is required: Docker Desktop (Windows/macOS) mounts tmpfs
-            # with noexec by default, which prevents the compiled binary from
-            # running even after chmod +x. Explicitly passing exec overrides it.
-            "tmpfs": {"/tmp": "size=128m,exec"},
-            "mem_limit": f"{self.memory_limit_mb}m",
-            "memswap_limit": f"{self.memory_limit_mb}m",  # disable swap
-            "pids_limit": 64,           # kill fork-bombs
-            # user is set per-phase in _run_phase:
-            #   compile → root  (needs to write binary to /tmp)
-            #   run     → nobody (untrusted user code must not run as root)
+            "labels": SANDBOX_LABEL,
+            "log_config": LogConfig(type=LogConfig.types.JSON, config={"max-size": "1m", "max-file": "1"}),
         }
-
-        # Seccomp profile — Linux production only
-        # On Windows/macOS Docker Desktop manages isolation differently;
-        # passing a seccomp profile there causes a Docker API error.
         if IS_LINUX and SECCOMP_PROFILE.exists():
-            kwargs["security_opt"] = [f"seccomp={SECCOMP_PROFILE.read_text()}"]
-            logger.debug("Seccomp profile loaded from %s", SECCOMP_PROFILE)
-
+            kwargs["security_opt"].append(f"seccomp={SECCOMP_PROFILE.read_text()}")
         return kwargs
 
-    def _wait_container(self, container: Container, phase: str) -> tuple[int, bool]:
-        """
-        Wait for container to finish. Returns (exit_code, timed_out).
-        Adds a 5-second grace period on top of cpu_time_limit to account
-        for container startup overhead (image layer mounting, JVM init, etc.)
-        This is especially important on Docker Desktop (Windows/macOS) where
-        the VM layer adds 1-3 seconds of overhead.
-        """
-        wall_clock = self.cpu_time_limit + 5
-        timed_out = False
+    def _start_and_wait(self, kwargs: dict, timeout_s: int):
+        """Returns (container, exit_code, host_timed_out, elapsed_ms)."""
+        start = time.monotonic()
+        container = self.client.containers.run(**kwargs)
+        host_timed_out = False
         exit_code = 1
-
         try:
-            result = container.wait(timeout=wall_clock)
-            exit_code = result.get("StatusCode", 1)
+            exit_code = container.wait(timeout=timeout_s).get("StatusCode", 1)
         except Exception:
-            timed_out = True
-            logger.warning(
-                "Container timed out during %s phase (limit=%ds)", phase, wall_clock
-            )
+            host_timed_out = True
             try:
                 container.kill()
             except Exception:
                 pass
+        return container, exit_code, host_timed_out, int((time.monotonic() - start) * 1000)
 
-        return exit_code, timed_out
-
-    def _collect_stats(self, container: Container) -> Optional[int]:
-        """
-        Read peak memory from Docker stats.
-        Returns KB or None if unavailable (common on Docker Desktop / cgroup v1).
-        """
-        try:
-            stats = container.stats(stream=False)
-            max_usage = stats.get("memory_stats", {}).get("max_usage", 0)
-            return max_usage // 1024 if max_usage else None
-        except Exception:
-            return None
-
-    def _collect_memory_from_file(self, code_dir: str) -> Optional[int]:
-        """
-        FIX #5: This method was called in _run_phase but never defined,
-        causing an AttributeError on any non-Linux host.
-
-        Parses the 'Maximum resident set size' line written by
-        `/usr/bin/time -v` (GNU time) into the time_stats.txt file.
-        Returns KB, or None if the file is absent or unparseable
-        (e.g. BusyBox time on Alpine, or macOS Docker Desktop).
-        """
-        stats_file = Path(code_dir) / "time_stats.txt"
-        if not stats_file.exists():
-            return None
-        try:
-            text = stats_file.read_text(errors="replace")
-            # GNU time outputs: "\tMaximum resident set size (kbytes): 12345"
-            match = re.search(r"Maximum resident set size \(kbytes\):\s*(\d+)", text)
-            return int(match.group(1)) if match else None
-        except Exception:
-            return None
-
-    def _remove(self, container: Optional[Container]):
-        if container:
+    @staticmethod
+    def _remove(container):
+        if container is not None:
             try:
                 container.remove(force=True)
             except Exception:
                 pass
 
-    def _execute(self, config: LanguageConfig, code_dir: str) -> SandboxResult:
-        """
-        Two-container strategy for compiled languages:
+    def _image_missing(self, config: LanguageConfig) -> SandboxResult:
+        msg = (
+            f"Judge image '{config.image}' is not built. "
+            f"Run: docker build -t {config.image} judge/languages/{config.build_dir}"
+        )
+        logger.error(msg)
+        return _infra_result(msg)
 
-        Container 1 — compile only, runs as root.
-          Root is required because Docker mounts the /tmp tmpfs as root:root
-          755, and the compiler must write the binary there. Stderr flows into
-          Docker logs so we can read it after exit. On failure → compile_error.
-
-        Container 2 — compile+run, also starts as root.
-          Recompiles (fast; code already verified above), then uses
-          `su -s /bin/sh nobody` to drop privileges before executing the
-          binary. Untrusted user code never runs as root.
-          On failure → runtime error.
-
-        Interpreted languages skip both and use a single run container as nobody.
-        """
-
-        if config.compile_cmd:
-            # Phase 1: compile only — stderr flows naturally into Docker logs
-            # so we can read it after the container exits.
-            compile_result = self._run_phase(
-                config, code_dir, config.compile_cmd, "compile"
-            )
-            if compile_result.exit_code != 0 or compile_result.timed_out:
-                return SandboxResult(
-                    stdout="",
-                    stderr=compile_result.stderr,
-                    exit_code=compile_result.exit_code,
-                    time_ms=compile_result.time_ms,
-                    memory_kb=None,
-                    timed_out=compile_result.timed_out,
-                    compile_error=True,
-                    compile_stderr=compile_result.stderr,
-                )
-
-            # Phase 2: single combined container — compile (as root, writes to
-            # /tmp) then immediately re-exec the binary as nobody so untrusted
-            # user code never runs with elevated privileges.
-            # Build the combined command: compile → optional chmod → run-as-nobody.
-            # chmod is needed for binary outputs (C++) so that nobody can exec
-            # the file that root just wrote. Java .class files are read by the
-            # JVM so they don't need +x.
-            parts = [config.compile_cmd]
-            if config.chmod_cmd:
-                parts.append(config.chmod_cmd)
-            parts.append(f"su -s /bin/sh nobody -c '{config.run_cmd}'")
-            combined_cmd = " && ".join(parts)
-            # Override user back to root for this container so the compile
-            # step can write to /tmp; the su above drops to nobody for run.
-            result = self._run_phase(config, code_dir, combined_cmd, "compile+run")
-            # Force user=root for compile+run (su handles the drop inside)
-            return result
-
-        # Interpreted languages — single run phase only.
-        return self._run_phase(config, code_dir, config.run_cmd, "run")
-
-    def _run_phase(
-        self,
-        config: LanguageConfig,
-        code_dir: str,
-        cmd: str,
-        phase: str,
-    ) -> SandboxResult:
-        start_time = time.monotonic()
+    def _compile(self, prepared: Prepared) -> Optional[SandboxResult]:
+        """Compile into /build. Returns None on success, otherwise a result."""
         container = None
-
         try:
-            kwargs = self._base_container_kwargs(config, code_dir)
-
-            # Compile phase runs as root so it can write the binary to /tmp
-            # (Docker mounts tmpfs as root:root 755 — nobody can't write to it).
-            # Run phase always executes as nobody — untrusted user code must
-            # never run as root regardless of platform.
-            # compile+run also starts as root; the combined command uses `su`
-            # to drop to nobody before executing the compiled binary.
-            if phase in ("compile", "compile+run"):
-                kwargs["user"] = "root"
-            else:
-                kwargs["user"] = "nobody"
-
-            # FIX #3: `/usr/bin/time -v` is GNU-only and breaks on Alpine/macOS.
-            # Use it only on Linux; fall back to Docker stats (or None) elsewhere.
-            if phase in ("run", "compile+run") and IS_LINUX:
-                actual_cmd = f'/usr/bin/time -v sh -c "{cmd}" 2>/code/time_stats.txt'
-            else:
-                actual_cmd = cmd
-
-            kwargs["command"] = ["/bin/sh", "-c", actual_cmd]
-            container = self.client.containers.run(**kwargs)
-
-            exit_code, timed_out = self._wait_container(container, phase)
-            elapsed_ms = int((time.monotonic() - start_time) * 1000)
-
-            # Memory: try Docker stats first (works on Linux cgroup v2),
-            # fall back to the GNU time output file (Linux only),
-            # otherwise None (Windows/macOS Docker Desktop).
-            memory_kb = self._collect_stats(container)
-            if not memory_kb:
-                # FIX #5: method now exists; safe to call on all platforms.
-                memory_kb = self._collect_memory_from_file(code_dir)
-
-            stdout = container.logs(stdout=True, stderr=False).decode("utf-8", errors="replace")
-
-            if phase in ("run", "compile+run") and IS_LINUX:
-                # GNU time wrote real stderr + timing lines to time_stats.txt.
-                # Strip the timing lines; keep only actual program stderr.
-                stderr_file = Path(code_dir) / "time_stats.txt"
-                try:
-                    raw_stderr = stderr_file.read_text(errors="replace") if stderr_file.exists() else ""
-                    stderr = "\n".join(
-                        line for line in raw_stderr.splitlines()
-                        if not any(k in line for k in [
-                            "Command being timed", "Maximum resident", "Elapsed",
-                            "Percent of CPU", "Major (requiring", "Minor (reclaiming",
-                            "Voluntary context", "Involuntary context", "File system",
-                            "Socket messages", "Signals delivered", "Page size",
-                            "Exit status", "wall clock", "Maximum",
-                        ])
-                    )
-                except Exception:
-                    stderr = container.logs(stdout=False, stderr=True).decode("utf-8", errors="replace")
-            else:
-                stderr = container.logs(stdout=False, stderr=True).decode("utf-8", errors="replace")
-
+            kwargs = self._container_kwargs(
+                prepared, build_mode="rw", memory_mb=self.compile_memory_limit_mb,
+                tmpfs_opts="size=256m,mode=1777", pids=256, script=".cq_compile.sh",
+            )
+            container, rc, host_timed_out, elapsed_ms = self._start_and_wait(
+                kwargs, self.compile_time_limit + HOST_GRACE_SECONDS
+            )
+            output = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace")
+            timed_out = host_timed_out or rc == 124
+            if rc == 0 and not timed_out:
+                return None
+            if timed_out:
+                output = (output + f"\nCompilation exceeded {self.compile_time_limit}s.").strip()
             return SandboxResult(
-                stdout=stdout[:65_536],
-                stderr=stderr[:8_192],
+                stdout="", stderr=output, exit_code=rc, time_ms=elapsed_ms, memory_kb=None,
+                timed_out=False, compile_error=True, compile_stderr=output,
+            )
+        except ImageNotFound:
+            return self._image_missing(prepared.config)
+        except (APIError, DockerException) as exc:
+            logger.error("Docker error during compile: %s", exc)
+            return _infra_result(f"Internal judge error during compilation: {exc}")
+        finally:
+            self._remove(container)
+
+    def _run(self, prepared: Prepared) -> SandboxResult:
+        config = prepared.config
+        container = None
+        try:
+            kwargs = self._container_kwargs(
+                prepared, build_mode="ro", memory_mb=self.memory_limit_mb,
+                tmpfs_opts="size=64m,mode=1777,exec", pids=64, script=".cq_run.sh",
+            )
+            container, rc, host_timed_out, elapsed_ms = self._start_and_wait(
+                kwargs, self.cpu_time_limit + HOST_GRACE_SECONDS
+            )
+            stdout = container.logs(stdout=True, stderr=False).decode("utf-8", errors="replace")
+            raw_stderr = container.logs(stdout=False, stderr=True).decode("utf-8", errors="replace")
+            stderr, stats = _split_stats(raw_stderr)
+            try:
+                container.reload()
+                oom_killed = bool(container.attrs.get("State", {}).get("OOMKilled"))
+            except Exception:
+                oom_killed = False
+
+            if stats is not None:
+                exit_code = stats["rc"]
+                time_ms = max(0, stats["ns"] // 1_000_000)
+                memory_kb = stats["mem"] // 1024 if stats["mem"] else None
+                output_exceeded = stats["out"] > MAX_STDOUT_BYTES
+            else:  # wrapper itself was killed (host timeout / OOM of the shell)
+                exit_code, time_ms, memory_kb, output_exceeded = rc, elapsed_ms, None, False
+
+            if rc == 98 and stats is None and config.pre_run_cmd:
+                return _infra_result(f"Sandbox setup failed: {stderr.strip()[:500]}")
+
+            limit_ms = self.cpu_time_limit * 1000
+            timed_out = (
+                host_timed_out
+                or exit_code == 124
+                or (exit_code == 137 and time_ms >= limit_ms - 50)
+                or time_ms > limit_ms
+            )
+            memory_exceeded = not timed_out and (
+                oom_killed
+                or exit_code == 137
+                or any(marker in stderr for marker in config.oom_markers)
+            )
+            return SandboxResult(
+                stdout=stdout,
+                stderr=stderr[:MAX_STDERR_BYTES],
                 exit_code=exit_code,
-                time_ms=elapsed_ms,
+                time_ms=min(time_ms, limit_ms) if timed_out else time_ms,
                 memory_kb=memory_kb,
                 timed_out=timed_out,
+                memory_exceeded=memory_exceeded,
+                output_exceeded=output_exceeded and not timed_out,
             )
-
         except ImageNotFound:
-            lang = config.image.replace("codequest-", "")
-            msg = (
-                f"Docker image '{config.image}' not found. "
-                f"Build: docker build -t {config.image} ./languages/{lang}"
-            )
-            logger.error(msg)
-            return SandboxResult("", msg, 1, 0, None, False)
-
-        except APIError as exc:
-            logger.error("Docker API error during %s: %s", phase, exc)
-            return SandboxResult("", f"Internal judge error: {exc}", 1, 0, None, False)
-
+            return self._image_missing(config)
+        except (APIError, DockerException) as exc:
+            logger.error("Docker error during run: %s", exc)
+            return _infra_result(f"Internal judge error: {exc}")
         finally:
             self._remove(container)
 
 
 # ─── Self-test ────────────────────────────────────────────────────────────────
-#
-# Run:   python sandbox.py
-# All 5 tests must pass before deploying the judge worker.
-#
-
+# Run:   python sandbox.py        (requires Docker + the four codequest-* images)
 
 def _assert(condition: bool, label: str, result: SandboxResult):
-    icon = "✅" if condition else "❌"
-    print(f"  {icon} {label}")
+    icon = "PASS" if condition else "FAIL"
+    print(f"  [{icon}] {label}")
     if not condition:
-        print(f"     stdout:        {result.stdout!r}")
-        print(f"     stderr:        {result.stderr!r}")
-        print(f"     exit_code:     {result.exit_code}")
-        print(f"     timed_out:     {result.timed_out}")
-        print(f"     compile_error: {result.compile_error}")
+        print(f"     {result!r}")
+        print(f"     stdout: {result.stdout[:300]!r}")
+        print(f"     stderr: {(result.compile_stderr or result.stderr)[:300]!r}")
         sys.exit(1)
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    print(f"\nSandbox self-test on {platform.system()} {platform.release()} / Python {sys.version.split()[0]}\n")
 
-    print(f"\n{'='*50}")
-    print(f"  Sandbox self-test")
-    print(f"  Platform: {platform.system()} {platform.release()}")
-    print(f"  Python:   {sys.version.split()[0]}")
-    print(f"{'='*50}\n")
+    sb = Sandbox(cpu_time_limit=5)
+    add = {
+        "python": "a, b = map(int, open(0).read().split())\nprint(a + b)\n",
+        "javascript": "const [a, b] = require('fs').readFileSync(0, 'utf8').trim().split(/\\s+/).map(Number);\nconsole.log(a + b);\n",
+        "cpp": "#include <iostream>\nint main(){long long a,b;std::cin>>a>>b;std::cout<<a+b<<std::endl;}\n",
+        "java": "import java.util.*;\npublic class Solution{public static void main(String[] x){Scanner s=new Scanner(System.in);System.out.println(s.nextLong()+s.nextLong());}}\n",
+    }
+    for lang, src in add.items():
+        r = sb.run(lang, src, "4 6\n")
+        _assert(r.success and r.stdout.strip() == "10", f"{lang}: stdin -> stdout (time={r.time_ms}ms mem={r.memory_kb}KB)", r)
 
-    sb = Sandbox(cpu_time_limit=15)
-
-    # ── Test 1: Python — basic stdout ───────────────────────────────────────
-    print("Test 1: Python basic stdout")
-    r = sb.run("python", "print('hello world')\n", "")
-    _assert(r.success, "success=True", r)
-    _assert("hello world" in r.stdout, "stdout contains 'hello world'", r)
-    print(f"  ℹ  time={r.time_ms}ms  memory={r.memory_kb}KB\n")
-
-    # ── Test 2: Python — stdin reading ──────────────────────────────────────
-    print("Test 2: Python stdin reading")
-    code = "import sys\nlines=sys.stdin.read().strip().split('\\n')\nprint(int(lines[0])+int(lines[1]))\n"
-    r = sb.run("python", code, "3\n7")
-    _assert(r.success, "success=True", r)
-    _assert("10" in r.stdout, "stdout contains '10'", r)
-    print(f"  ℹ  time={r.time_ms}ms\n")
-
-    # ── Test 3: Python — runtime error ──────────────────────────────────────
-    print("Test 3: Python runtime error")
     r = sb.run("python", "raise ValueError('boom')\n", "")
-    _assert(not r.success, "success=False", r)
-    _assert(r.exit_code != 0, "exit_code != 0", r)
-    _assert(not r.timed_out, "timed_out=False", r)
-    _assert("boom" in r.stderr, "stderr contains 'boom'", r)
-    print(f"  ℹ  exit_code={r.exit_code}\n")
-
-    # ── Test 4: Python — infinite loop (TLE) ────────────────────────────────
-    print("Test 4: Python timeout (TLE) — this takes ~cpu_time_limit seconds …")
-    sb_short = Sandbox(cpu_time_limit=3)
-    r = sb_short.run("python", "while True: pass\n", "")
-    _assert(not r.success, "success=False", r)
-    _assert(r.timed_out, "timed_out=True", r)
-    print(f"  ℹ  time={r.time_ms}ms\n")
-
-    # ── Test 5: C++ — compile + run ─────────────────────────────────────────
-    print("Test 5: C++ compile + run")
-    cpp_code = (
-        "#include <iostream>\n"
-        "#include <string>\n"
-        "int main(){\n"
-        "  int a,b; std::cin>>a>>b;\n"
-        "  std::cout<<a+b<<std::endl;\n"
-        "  return 0;\n"
-        "}\n"
-    )
-    r = sb.run("cpp", cpp_code, "4\n6")
-    _assert(r.success, "success=True", r)
-    _assert("10" in r.stdout, "stdout contains '10'", r)
-    print(f"  ℹ  time={r.time_ms}ms\n")
-
-    # ── Test 6: C++ — compile error ─────────────────────────────────────────
-    print("Test 6: C++ compile error")
-    bad_cpp = "int main() { this is not valid c++; }\n"
-    r = sb.run("cpp", bad_cpp, "")
-    _assert(not r.success, "success=False", r)
-    _assert(r.compile_error, "compile_error=True", r)
-    _assert(not r.timed_out, "timed_out=False", r)
-    print(f"  ℹ  compile_stderr={r.compile_stderr[:80]!r}\n")
-
-    print("=" * 50)
-    print("  ✅  All tests passed — sandbox ready")
-    print("=" * 50 + "\n")
+    _assert(not r.success and r.exit_code != 0 and "boom" in r.stderr and not r.timed_out, "python: runtime error", r)
+    r = sb.run("cpp", "int main() { this is not c++; }\n", "")
+    _assert(r.compile_error and "error" in r.compile_stderr, "cpp: compile error", r)
+    r = sb.run("java", "public class Solution { void x( }\n", "")
+    _assert(r.compile_error, "java: compile error", r)
+    r = Sandbox(cpu_time_limit=2).run("python", "while True: pass\n", "")
+    _assert(r.timed_out, f"python: time limit (time={r.time_ms}ms)", r)
+    r = sb.run("python", "x = bytearray(1024 * 1024 * 1024)\n", "")
+    _assert(r.memory_exceeded, f"python: memory limit (exit={r.exit_code})", r)
+    r = sb.run("python", "import sys\nsys.stdout.write('x' * 200000)\n", "")
+    _assert(r.output_exceeded, "python: output limit", r)
+    r = sb.run("python", "import os\nprint(os.getuid())\n", "")
+    _assert(r.success and r.stdout.strip() == "65534", "python: runs as nobody", r)
+    r = sb.run("python", "import urllib.request\nurllib.request.urlopen('http://1.1.1.1', timeout=3)\n", "")
+    _assert(not r.success, "python: no network", r)
+    print("\nAll sandbox self-tests passed.\n")

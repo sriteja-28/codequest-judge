@@ -2,251 +2,365 @@
 runner.py — Orchestrates one submission through all test cases.
 
 Flow:
-  1. POST callback → backend (status=RUNNING)
-  2. Fetch test cases from DB
-  3. For each test case: Sandbox.run() → compare output
-  4. POST final callback with all results
+  1. POST callback → backend (status=RUNNING)            [best effort]
+  2. Fetch test cases (backend internal API by default, or the DB)
+  3. Compile once (C++/Java), run each test case in a fresh container, compare
+  4. POST the final verdict with per-test results
 
-Stops at first non-ACCEPTED result (standard OJ behaviour).
-Override stop_on_fail=False to run all test cases (useful for debugging).
+Stops at the first non-ACCEPTED test case (standard OJ behaviour); pass
+stop_on_fail=False to run all test cases.
+
+Errors:
+  JudgeInfrastructureError — retryable (Docker down, backend unreachable,
+                              test cases not loadable). The worker retries the
+                              job and finally reports INTERNAL_ERROR.
+  CallbackRejected         — the backend answered 4xx (contract problem);
+                              not retryable.
+Verdict callbacks are idempotent on the backend, so re-running a job after a
+partial failure is safe.
 """
 
 import logging
-import os
+import time
+
 import requests
 from decouple import config
 
-from sandbox import Sandbox, SandboxResult
-from comparator import compare
+from codegen import SignatureError, encode_input, split_result, validate_signature, wrap
+from comparator import compare_output
+from sandbox import Prepared, Sandbox, SandboxResult
 
 logger = logging.getLogger(__name__)
 
-BACKEND_API_URL       = config("BACKEND_API_URL",       default="http://localhost:8000")
+BACKEND_API_URL = config("BACKEND_API_URL", default="http://127.0.0.1:8000").rstrip("/")
 JUDGE_INTERNAL_API_KEY = config("JUDGE_INTERNAL_API_KEY", default="judge-secret-key-change-me")
-CPU_TIME_LIMIT        = config("CPU_TIME_LIMIT",        default=10,  cast=int)
-MEMORY_LIMIT_MB       = config("MEMORY_LIMIT_MB",       default=256, cast=int)
+CPU_TIME_LIMIT = config("CPU_TIME_LIMIT", default=10, cast=int)
+MEMORY_LIMIT_MB = config("MEMORY_LIMIT_MB", default=256, cast=int)
+# "api" (default): GET /api/submissions/judge/problems/<id>/testcases/ with the judge key.
+# "db": read the test_cases table directly (needs DATABASE_URL, PostgreSQL only).
+TESTCASE_SOURCE = config("TESTCASE_SOURCE", default="api").strip().lower()
+CALLBACK_RETRIES = config("CALLBACK_RETRIES", default=4, cast=int)
+HTTP_TIMEOUT = config("BACKEND_HTTP_TIMEOUT", default=15, cast=int)
+MAX_ERROR_MESSAGE_CHARS = 2_000
 
 HEADERS = {
     "X-Judge-Api-Key": JUDGE_INTERNAL_API_KEY,
-    "Content-Type":    "application/json",
+    "Content-Type": "application/json",
 }
+
+
+class JudgeInfrastructureError(Exception):
+    """Retryable failure that is not the submitted program's fault."""
+
+
+class CallbackRejected(Exception):
+    """The backend rejected a callback with a 4xx response (do not retry)."""
 
 
 # ─── Backend communication ────────────────────────────────────────────────────
 
-def _post_callback(submission_id: str, payload: dict, retries: int = 3):
+def _post_callback(submission_id: str, payload: dict, retries: int = CALLBACK_RETRIES) -> bool:
+    """POST a callback with exponential backoff. Returns True on HTTP 200,
+    raises CallbackRejected on a 4xx (except 429), False if never delivered."""
     url = f"{BACKEND_API_URL}/api/submissions/{submission_id}/judge-callback/"
+    delay = 1.0
     for attempt in range(1, retries + 1):
         try:
-            resp = requests.post(url, json=payload, headers=HEADERS, timeout=15)
+            resp = requests.post(url, json=payload, headers=HEADERS, timeout=HTTP_TIMEOUT)
+        except requests.RequestException as exc:
+            logger.warning("Callback network error for %s (attempt %d/%d): %s", submission_id, attempt, retries, exc)
+        else:
             if resp.status_code == 200:
-                return
-            logger.error("Callback HTTP %d (attempt %d): %s", resp.status_code, attempt, resp.text[:200])
-        except Exception as exc:
-            logger.error("Callback network error (attempt %d): %s", attempt, exc)
+                return True
+            if 400 <= resp.status_code < 500 and resp.status_code != 429:
+                raise CallbackRejected(f"HTTP {resp.status_code}: {resp.text[:300]}")
+            logger.warning("Callback HTTP %d for %s (attempt %d/%d)", resp.status_code, submission_id, attempt, retries)
+        if attempt < retries:
+            time.sleep(delay)
+            delay = min(delay * 2, 10.0)
     logger.error("All %d callback attempts failed for submission %s", retries, submission_id)
+    return False
 
 
-def _fetch_test_cases(problem_id: int, sample_only: bool = False) -> list[dict]:
-    """
-    Fetch test cases directly from the database.
-    Falls back to the backend API if DB creds aren't available.
-    """
-    return _fetch_test_cases_from_db(problem_id,sample_only=sample_only)
+def _fetch_problem_tests(problem_id: int, sample_only: bool = False) -> dict:
+    """Return problem judge config + test cases, from the API or the database."""
+    if TESTCASE_SOURCE == "db":
+        return _fetch_problem_tests_from_db(problem_id, sample_only=sample_only)
+    return _fetch_problem_tests_from_api(problem_id, sample_only=sample_only)
 
 
-def _fetch_test_cases_from_db(problem_id: int, sample_only: bool = False) -> list[dict]:
-    import psycopg2
+def _fetch_problem_tests_from_api(problem_id: int, sample_only: bool = False) -> dict:
+    url = f"{BACKEND_API_URL}/api/submissions/judge/problems/{problem_id}/testcases/"
+    params = {"sample_only": "1"} if sample_only else None
+    resp = requests.get(url, headers=HEADERS, params=params, timeout=HTTP_TIMEOUT)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _fetch_problem_tests_from_db(problem_id: int, sample_only: bool = False) -> dict:
     import dj_database_url
-    from decouple import config as dconfig
+    import psycopg2
 
-    db_url = dconfig(
-        "DATABASE_URL",
-        default="postgresql://codequest:codequest@localhost:5432/codequest",
-    )
+    db_url = config("DATABASE_URL", default="postgresql://codequest:codequest@localhost:5432/codequest")
     parsed = dj_database_url.parse(db_url)
-    conn   = psycopg2.connect(
-        host     = parsed["HOST"],
-        port     = parsed.get("PORT") or 5432,
-        dbname   = parsed["NAME"],
-        user     = parsed["USER"],
-        password = parsed["PASSWORD"],
+    conn = psycopg2.connect(
+        host=parsed["HOST"],
+        port=parsed.get("PORT") or 5432,
+        dbname=parsed["NAME"],
+        user=parsed["USER"],
+        password=parsed["PASSWORD"],
+        connect_timeout=10,
     )
     try:
         cur = conn.cursor()
-
-        query = """
-            SELECT id, input_data, expected_output, is_hidden, is_sample
-            FROM   test_cases
-            WHERE  problem_id = %s
-            {} ORDER  BY order_index """.format("AND is_sample = TRUE" if sample_only else "") 
-
-        # cur.execute(
-        #     """
-        #     SELECT id, input_data, expected_output, is_hidden
-        #     FROM   test_cases
-        #     WHERE  problem_id = %s
-        #     ORDER  BY order_index
-        #     """,
-        #     (problem_id,), )
+        cur.execute(
+            "SELECT function_signature, compare_mode, float_tolerance FROM problems WHERE id = %s",
+            (problem_id,),
+        )
+        problem = cur.fetchone()
+        if problem is None:
+            raise LookupError(f"problem {problem_id} does not exist")
+        query = (
+            "SELECT id, input_data, expected_output, is_hidden, is_sample "
+            "FROM test_cases WHERE problem_id = %s"
+            + (" AND is_sample = TRUE" if sample_only else "")
+            + " ORDER BY order_index, id"
+        )
         cur.execute(query, (problem_id,))
-       
-        rows = cur.fetchall()
-        return [
-            {"id": r[0], "input_data": r[1], "expected_output": r[2], "is_hidden": r[3]}
-            for r in rows
+        test_cases = [
+            {"id": r[0], "input_data": r[1], "expected_output": r[2], "is_hidden": r[3], "is_sample": r[4]}
+            for r in cur.fetchall()
         ]
+        return {
+            "problem_id": problem_id,
+            "function_signature": problem[0],
+            "compare_mode": problem[1],
+            "float_tolerance": problem[2],
+            "test_cases": test_cases,
+        }
     finally:
         conn.close()
 
 
-# ─── Status mapping ───────────────────────────────────────────────────────────
+# ─── Sandbox (one per worker process) ────────────────────────────────────────
 
-def _map_status(result: SandboxResult) -> str:
-    """
-    Convert a SandboxResult to a Django Submission.Status string.
-    Order of checks matters — timed_out must precede exit_code check.
-    """
+_sandbox = None
+
+
+def get_sandbox() -> Sandbox:
+    global _sandbox
+    if _sandbox is None:
+        try:
+            _sandbox = Sandbox(cpu_time_limit=CPU_TIME_LIMIT, memory_limit_mb=MEMORY_LIMIT_MB)
+        except Exception as exc:  # Docker daemon not reachable
+            raise JudgeInfrastructureError(f"Docker unavailable: {exc}") from exc
+    return _sandbox
+
+
+def reset_sandbox() -> None:
+    global _sandbox
+    _sandbox = None
+
+
+# ─── Verdicts ─────────────────────────────────────────────────────────────────
+
+def classify(
+    result: SandboxResult,
+    expected_output: str,
+    *,
+    compare_mode: str = "EXACT",
+    float_tolerance: float = 1e-5,
+    function_mode: bool = False,
+) -> str:
+    """Per-test-case status (order matters)."""
+    if result.infra_error:
+        return "INTERNAL_ERROR"
     if result.compile_error:
         return "COMPILE_ERROR"
     if result.timed_out:
         return "TIME_LIMIT"
-    if result.memory_kb and result.memory_kb * 1024 >= result.memory_kb:
-        # Memory limit checked by comparing against the configured cap.
-        # Docker kills the container with OOM (exit_code 137) if exceeded.
-        pass
-    if result.exit_code == 137:
-        # SIGKILL — typically OOM kill by Docker
+    if result.memory_exceeded:
         return "MEMORY_LIMIT"
-    if result.exit_code != 0:
+    if result.output_exceeded or result.exit_code != 0:
         return "RUNTIME_ERROR"
-    return "ACCEPTED"  # caller checks output match separately
+
+    if function_mode:
+        _, answer = split_result(result.stdout)
+        if answer is None:
+            # The harness never produced a return value: the function returned
+            # nothing and the process still exited cleanly.
+            return "WRONG_ANSWER"
+        actual = answer
+    else:
+        actual = result.stdout
+
+    return "ACCEPTED" if compare_output(actual, expected_output, compare_mode, float_tolerance) else "WRONG_ANSWER"
+
+
+def displayed_output(result: SandboxResult, function_mode: bool) -> str:
+    """The value shown in 'Actual output' (the return value in function mode)."""
+    if function_mode:
+        _, answer = split_result(result.stdout)
+        if answer is not None:
+            return answer
+    return result.stdout
+
+
+_SIGNALS = {134: "SIGABRT", 136: "SIGFPE", 137: "SIGKILL", 139: "SIGSEGV"}
+
+
+def failure_message(status: str, result: SandboxResult, sandbox: Sandbox) -> str:
+    if status == "COMPILE_ERROR":
+        return result.compile_stderr[:MAX_ERROR_MESSAGE_CHARS]
+    if status == "TIME_LIMIT":
+        return f"Time limit exceeded ({sandbox.cpu_time_limit}s)."
+    if status == "MEMORY_LIMIT":
+        tail = result.stderr.strip().splitlines()[-1:] if result.stderr.strip() else []
+        return (f"Memory limit exceeded ({sandbox.memory_limit_mb} MB)." + (f"\n{tail[0]}" if tail else ""))[:MAX_ERROR_MESSAGE_CHARS]
+    if status == "RUNTIME_ERROR":
+        if result.output_exceeded:
+            return "Output limit exceeded (more than 64 KB written to stdout)."
+        if result.stderr.strip():
+            return result.stderr.strip()[:MAX_ERROR_MESSAGE_CHARS]
+        signal = _SIGNALS.get(result.exit_code)
+        return f"Process exited with code {result.exit_code}" + (f" ({signal})." if signal else ".")
+    return ""
 
 
 # ─── Main entry point ─────────────────────────────────────────────────────────
 
+def _final(submission_id: str, payload: dict) -> None:
+    if not _post_callback(submission_id, payload):
+        raise JudgeInfrastructureError("Could not deliver the verdict to the backend.")
+
+
 def run_submission(
     submission_id: str,
-    problem_id:    int,
-    language:      str,
-    code:          str,
-    stop_on_fail:  bool = True,
-    run_sample:    bool = False, 
-) -> None:
-    """
-    Run all test cases for a submission and POST results to the backend.
-    """
-    logger.info(
-        "Starting submission %s | lang=%s | problem=%d",
-        submission_id, language, problem_id,
-    )
+    problem_id: int,
+    language: str,
+    code: str,
+    stop_on_fail: bool = True,
+    run_sample: bool = False,
+    sandbox: Sandbox | None = None,
+) -> str:
+    """Judge one submission and POST the verdict. Returns the overall status."""
+    logger.info("Starting submission %s | lang=%s | problem=%s | sample=%s",
+                submission_id, language, problem_id, run_sample)
 
-    # Tell backend we've started
-    _post_callback(submission_id, {"status": "RUNNING", "results": []})
+    _post_callback(submission_id, {"status": "RUNNING", "results": []}, retries=2)
 
-    # Fetch test cases
     try:
-        test_cases = _fetch_test_cases(problem_id, sample_only=run_sample)
+        problem = _fetch_problem_tests(problem_id, sample_only=run_sample)
+        test_cases = problem["test_cases"]
     except Exception as exc:
-        logger.error("Failed to fetch test cases: %s", exc)
-        _post_callback(submission_id, {
-            "status":        "INTERNAL_ERROR",
-            "error_message": f"Could not load test cases: {exc}",
-            "results":       [],
-        })
-        return
+        raise JudgeInfrastructureError(f"Could not load test cases: {exc}") from exc
+
+    raw_signature = problem.get("function_signature")
+    function_mode = bool(raw_signature)
+    signature = None
+    if function_mode:
+        try:
+            signature = validate_signature(raw_signature)
+            code = wrap(language, signature, code)
+        except (SignatureError, ValueError) as exc:
+            raise JudgeInfrastructureError(f"Problem {problem_id} has an invalid function signature: {exc}") from exc
+
+    compare_mode = problem.get("compare_mode") or "EXACT"
+    float_tolerance = problem.get("float_tolerance")
+    if float_tolerance is None:
+        float_tolerance = 1e-5
 
     if not test_cases:
-        logger.error("No test cases found for problem %d", problem_id)
-        _post_callback(submission_id, {
-            "status":        "INTERNAL_ERROR",
-            "error_message": "No test cases configured for this problem.",
-            "results":       [],
+        logger.error("No test cases found for problem %s (sample_only=%s)", problem_id, run_sample)
+        _final(submission_id, {
+            "status": "INTERNAL_ERROR",
+            "error_message": "No test cases are configured for this problem.",
+            "results": [],
         })
-        return
+        return "INTERNAL_ERROR"
 
-    sandbox = Sandbox(
-        cpu_time_limit  = CPU_TIME_LIMIT,
-        memory_limit_mb = MEMORY_LIMIT_MB,
-    )
+    sandbox = sandbox or get_sandbox()
+    prepared = sandbox.prepare(language, code)
+    if isinstance(prepared, SandboxResult):  # unsupported language / infrastructure
+        if prepared.infra_error:
+            raise JudgeInfrastructureError(prepared.stderr)
+        _final(submission_id, {"status": "INTERNAL_ERROR", "error_message": prepared.stderr, "results": []})
+        return "INTERNAL_ERROR"
 
-    results:         list[dict] = []
-    overall_status:  str        = "ACCEPTED"
-    max_runtime_ms:  int        = 0
-    max_memory_kb:   int        = 0
-    error_message:   str        = ""
-
-    for tc in test_cases:
-        result: SandboxResult = sandbox.run(language, code, tc["input_data"])
-
-
-        # adding debug logs here
-        logger.debug("----- Test Case Debug -----")
-        logger.debug("INPUT: %s", tc["input_data"])
-        logger.debug("EXPECTED: %s", repr(tc["expected_output"]))
-        logger.debug("GOT: %s", repr(result.stdout))
-        logger.debug("---------------------------")
-
-        # Determine per-testcase status
-        if result.compile_error:
-            tc_status = "COMPILE_ERROR"
-        elif result.timed_out:
-            tc_status = "TIME_LIMIT"
-        elif result.exit_code == 137:
-            tc_status = "MEMORY_LIMIT"
-        elif result.exit_code != 0:
-            tc_status = "RUNTIME_ERROR"
-            
-        elif compare(result.stdout, tc["expected_output"]):
-            tc_status = "ACCEPTED"
+    results: list[dict] = []
+    overall_status = "ACCEPTED"
+    error_message = ""
+    max_runtime_ms = 0
+    max_memory_kb = 0
+    try:
+        if not prepared.ok:
+            compile_result = prepared.compile_result
+            if compile_result.infra_error:
+                raise JudgeInfrastructureError(compile_result.stderr)
+            overall_status = "COMPILE_ERROR"
+            error_message = failure_message("COMPILE_ERROR", compile_result, sandbox)
+            results.append({
+                "test_case_id": test_cases[0]["id"],
+                "status": "COMPILE_ERROR",
+                "actual_output": "",
+                "error_output": compile_result.compile_stderr,
+                "time_ms": None,
+                "memory_kb": None,
+            })
         else:
-            tc_status = "WRONG_ANSWER"
+            for tc in test_cases:
+                try:
+                    stdin_data = encode_input(signature, tc["input_data"]) if function_mode else tc["input_data"]
+                except ValueError as exc:
+                    raise JudgeInfrastructureError(
+                        f"Problem {problem_id} test case {tc['id']} has invalid function input: {exc}"
+                    ) from exc
 
-        # Track peak resource usage across all test cases
-        if result.time_ms:
-            max_runtime_ms = max(max_runtime_ms, result.time_ms)
-        if result.memory_kb:
-            max_memory_kb = max(max_memory_kb, result.memory_kb)
+                result = sandbox.execute(prepared, stdin_data)
+                if result.infra_error:
+                    raise JudgeInfrastructureError(result.stderr)
+                tc_status = classify(
+                    result,
+                    tc["expected_output"],
+                    compare_mode=compare_mode,
+                    float_tolerance=float_tolerance,
+                    function_mode=function_mode,
+                )
+                logger.debug("tc#%s -> %s (%sms, %sKB)", tc["id"], tc_status, result.time_ms, result.memory_kb)
 
-        # Build result record
-        tc_record = {
-            "test_case_id":   tc["id"],
-            "status":         tc_status,
-            "actual_output":  result.stdout,
-            "error_output":   result.stderr if not result.compile_error else result.compile_stderr,
-            "time_ms":        result.time_ms,
-            "memory_kb":      result.memory_kb,
-        }
-        results.append(tc_record)
+                if result.time_ms:
+                    max_runtime_ms = max(max_runtime_ms, result.time_ms)
+                if result.memory_kb:
+                    max_memory_kb = max(max_memory_kb, result.memory_kb)
 
-        # Set overall status on first failure
-        if tc_status != "ACCEPTED" and overall_status == "ACCEPTED":
-            overall_status = tc_status
-            if tc_status in ("RUNTIME_ERROR", "COMPILE_ERROR"):
-                error_message = (
-                    result.compile_stderr if result.compile_error else result.stderr
-                )[:2_000]
+                results.append({
+                    "test_case_id": tc["id"],
+                    "status": tc_status,
+                    "actual_output": displayed_output(result, function_mode),
+                    "error_output": result.stderr,
+                    "time_ms": result.time_ms,
+                    "memory_kb": result.memory_kb,
+                })
 
-        # Stop on first failure (standard judge behaviour)
-        if stop_on_fail and tc_status != "ACCEPTED":
-            logger.debug(
-                "Stopping after first failure: %s on tc#%d",
-                tc_status, tc["id"],
-            )
-            break
+                if tc_status != "ACCEPTED" and overall_status == "ACCEPTED":
+                    overall_status = tc_status
+                    error_message = failure_message(tc_status, result, sandbox)
+                if stop_on_fail and tc_status != "ACCEPTED":
+                    break
+    finally:
+        sandbox.cleanup(prepared)
 
     logger.info(
-        "Submission %s → %s | %dms | %dKB | %d/%d TCs",
-        submission_id, overall_status,
-        max_runtime_ms, max_memory_kb,
-        sum(1 for r in results if r["status"] == "ACCEPTED"),
-        len(test_cases),
+        "Submission %s → %s | %dms | %dKB | %d/%d TCs passed",
+        submission_id, overall_status, max_runtime_ms, max_memory_kb,
+        sum(1 for r in results if r["status"] == "ACCEPTED"), len(test_cases),
     )
 
-    _post_callback(submission_id, {
-        "status":        overall_status,
-        "runtime_ms":    max_runtime_ms or None,
-        "memory_kb":     max_memory_kb  or None,
+    _final(submission_id, {
+        "status": overall_status,
+        "runtime_ms": max_runtime_ms or None,
+        "memory_kb": max_memory_kb or None,
         "error_message": error_message,
-        "results":       results,
+        "results": results,
     })
+    return overall_status

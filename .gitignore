@@ -20,3 +20,9 @@ __pycache__/
 # compiled outputs
 *.o
 *.out
+# env templates are documentation and must be committed
+!.env.example
+
+# editor-managed virtualenv (VS Code formatter)
+.venv/
+.pytest_cache/
